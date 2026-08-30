@@ -13,7 +13,8 @@ jobs:
           python-version: '3.12'
           cache: pip
       - run: python -m pip install --upgrade pip
-      - run: pip install -e .
+      - run: pip install -e '.[test]'
       - run: python -m compileall -q app
+      - run: pytest -q
       - run: python -c "from app.main import app, LIVE_ADVERTISING_ENABLED; assert app; assert LIVE_ADVERTISING_ENABLED is False"
       - run: python -c "from app.providers.meta import MetaAdsConnector; assert MetaAdsConnector.live_writes_enabled is False"
