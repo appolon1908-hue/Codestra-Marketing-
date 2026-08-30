@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .db import get_session
 from .models import ApprovalModel, CampaignModel
+from .providers.meta_read import MetaReadClient
 
 app = FastAPI(title="Codestra Marketing API", version="0.2.0")
 LIVE_ADVERTISING_ENABLED = os.getenv("LIVE_ADVERTISING_ENABLED", "false").lower() == "true"
@@ -88,3 +89,19 @@ async def activate_campaign(campaign_id: UUID, session: AsyncSession = Depends(g
 async def list_campaigns(tenant_id: str, session: AsyncSession = Depends(get_session)) -> list[Campaign]:
     result = await session.execute(select(CampaignModel).where(CampaignModel.tenant_id == tenant_id).order_by(CampaignModel.created_at.desc()))
     return [Campaign.model_validate(row) for row in result.scalars().all()]
+
+@app.get("/v1/providers/meta/accounts/{ad_account_id}/campaigns")
+async def meta_campaign_snapshots(ad_account_id: str) -> list[dict[str, object]]:
+    if not META_READ_SYNC_ENABLED:
+        return []
+    snapshots = await MetaReadClient().list_campaigns(ad_account_id)
+    return [
+        {
+            "provider_campaign_id": item.provider_campaign_id,
+            "name": item.name,
+            "status": item.status,
+            "objective": item.objective,
+            "daily_budget_minor": item.daily_budget_minor,
+        }
+        for item in snapshots
+    ]
