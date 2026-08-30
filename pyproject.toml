@@ -1,0 +1,9 @@
+[project]
+name = "codestra-marketing"
+version = "0.1.0"
+description = "Codestra paid acquisition and marketing control plane"
+requires-python = ">=3.12"
+dependencies = ["fastapi>=0.116,<1", "uvicorn[standard]>=0.35,<1", "pydantic>=2.11,<3"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
