@@ -1,7 +1,7 @@
-from app.db import Base
-from app.models import Campaign
+from app.models import ApprovalModel, AudienceModel, CampaignModel, CreativeModel
 
 
-def test_campaign_has_tenant_boundary():
-    assert "tenant_id" in Campaign.__table__.columns.keys()
-    assert Campaign.__table__.columns["tenant_id"].nullable is False
+def test_every_marketing_aggregate_has_a_required_tenant_boundary():
+    for model in (CampaignModel, ApprovalModel, AudienceModel, CreativeModel):
+        column = model.__table__.columns["tenant_id"]
+        assert column.nullable is False
