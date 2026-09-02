@@ -3,12 +3,14 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from datetime import UTC, datetime
+import asyncio
+from datetime import datetime, timezone
 from enum import StrEnum
 from typing import Annotated, Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, status
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -28,6 +30,20 @@ META_ALLOWED_AD_ACCOUNT_IDS = {
     for value in os.getenv("META_ALLOWED_AD_ACCOUNT_IDS", "").split(",")
     if value.strip()
 }
+SERVICE = "codestra-marketing"
+
+
+@app.middleware("http")
+async def operational_headers(request: Request, call_next):
+    correlation_id = request.headers.get("X-Correlation-ID") or str(uuid4())
+    request.state.correlation_id = correlation_id
+    try:
+        response = await call_next(request)
+    except Exception:
+        response = JSONResponse(status_code=500, content={"detail": "internal_error", "correlation_id": correlation_id})
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Correlation-ID"] = correlation_id
+    return response
 
 TenantHeader = Annotated[str, Header(alias="X-Tenant-ID", min_length=1, max_length=64)]
 IdempotencyHeader = Annotated[str, Header(alias="Idempotency-Key", min_length=8, max_length=200)]
@@ -127,17 +143,45 @@ async def _campaign_for_tenant(session: AsyncSession, campaign_id: UUID, tenant_
 
 
 @app.get("/health")
-def health() -> dict[str, object]:
+def health(request: Request = None) -> dict[str, object]:
+    correlation_id = getattr(getattr(request, "state", None), "correlation_id", str(uuid4()))
     return {
         "status": "ok",
-        "live_advertising_enabled": LIVE_ADVERTISING_ENABLED,
-        "meta_read_sync_enabled": META_READ_SYNC_ENABLED,
+        "service": SERVICE,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "correlation_id": correlation_id,
     }
 
 
+@app.get("/ready")
+async def ready(request: Request, session: AsyncSession = Depends(get_session)):
+    try:
+        await asyncio.wait_for(session.execute(select(1)), timeout=2.0)
+    except Exception:
+        return JSONResponse(status_code=503, content={"status": "not_ready", "service": SERVICE, "dependencies": {"database": "unavailable"}, "correlation_id": request.state.correlation_id})
+    return {"status": "ready", "service": SERVICE, "dependencies": {"database": "ready", "configuration": "ready"}, "correlation_id": request.state.correlation_id}
+
+
+@app.get("/version")
+def version(request: Request = None) -> dict[str, object]:
+    correlation_id = getattr(getattr(request, "state", None), "correlation_id", str(uuid4()))
+    return {"service": SERVICE, "application_version": app.version, "api_versions": ["v1"], "git_sha": os.getenv("CODESTRA_GIT_SHA", "unknown"), "image_digest": os.getenv("CODESTRA_IMAGE_DIGEST", "unknown"), "build_timestamp": os.getenv("CODESTRA_BUILD_TIMESTAMP", "unknown"), "migration_revision": os.getenv("CODESTRA_MIGRATION_REVISION", "unknown"), "environment": os.getenv("CODESTRA_ENVIRONMENT", "unknown"), "correlation_id": correlation_id}
+
+
+@app.get("/capabilities")
 @router.get("/capabilities")
-def capabilities() -> dict[str, object]:
+def capabilities(request: Request = None) -> dict[str, object]:
+    correlation_id = getattr(getattr(request, "state", None), "correlation_id", str(uuid4()))
     return {
+        "service": SERVICE,
+        "maintenance_mode": os.getenv("MAINTENANCE_MODE", "false").lower() == "true",
+        "degraded_mode": False,
+        "business_writes_enabled": False,
+        "external_delivery_enabled": LIVE_ADVERTISING_ENABLED,
+        "live_advertising_enabled": LIVE_ADVERTISING_ENABLED,
+        "read_only_mode": not LIVE_ADVERTISING_ENABLED,
+        "simulation_enabled": not LIVE_ADVERTISING_ENABLED,
+        "supported_api_versions": ["v1"],
         "campaigns": True,
         "audiences": True,
         "creatives": True,
@@ -145,6 +189,7 @@ def capabilities() -> dict[str, object]:
         "attribution": False,
         "meta_read_sync": META_READ_SYNC_ENABLED,
         "provider_writes": LIVE_ADVERTISING_ENABLED,
+        "correlation_id": correlation_id,
     }
 
 
@@ -272,7 +317,7 @@ async def approve_campaign(
     approval.state = "approved"
     approval.decided_by = body.actor_id
     approval.reason = body.reason
-    approval.decided_at = datetime.now(UTC)
+    approval.decided_at = datetime.now(timezone.utc)
     row.state = CampaignState.APPROVED.value
     await session.commit()
     await session.refresh(row)
