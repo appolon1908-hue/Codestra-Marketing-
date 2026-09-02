@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import uuid
 
 import pytest
@@ -36,8 +37,111 @@ from app.main import (
     update_creative,
 )
 from app.models import AuditEventModel, CampaignModel, OperationModel, OutboxModel
+from app.middleware_client import MiddlewareDeliveryError
+from app.outbox_worker import run_once
 
 pytestmark = pytest.mark.postgres
+
+
+class _RecordingMiddleware:
+    def __init__(self, error: MiddlewareDeliveryError | None = None):
+        self.error = error
+        self.payloads: list[dict[str, object]] = []
+
+    async def deliver(self, payload: dict[str, object]) -> dict[str, object]:
+        self.payloads.append(payload)
+        if self.error is not None:
+            raise self.error
+        return {"operation_id": "middleware-operation-1", "state": "accepted"}
+
+
+async def _seed_outbox(sessions, suffix: str) -> uuid.UUID:
+    operation_id = uuid.uuid4()
+    campaign_id = uuid.uuid4()
+    tenant_id = f"tenant-worker-{suffix}-{uuid.uuid4()}"
+    correlation_id = f"corr-{uuid.uuid4()}"
+    payload = {
+        "operation_id": str(operation_id),
+        "campaign_id": str(campaign_id),
+        "tenant_id": tenant_id,
+        "correlation_id": correlation_id,
+    }
+    async with sessions() as session:
+        session.add(
+            OperationModel(
+                id=operation_id,
+                tenant_id=tenant_id,
+                kind="campaign.activate",
+                aggregate_id=campaign_id,
+                state="pending",
+                idempotency_key=f"worker-{suffix}-{uuid.uuid4()}",
+                request_fingerprint="0" * 64,
+                requested_by="test-operator",
+                correlation_id=correlation_id,
+            )
+        )
+        session.add(
+            OutboxModel(
+                tenant_id=tenant_id,
+                operation_id=operation_id,
+                destination="middleware",
+                event_type="marketing.campaign.activation_requested",
+                payload_json=json.dumps(payload, sort_keys=True, separators=(",", ":")),
+            )
+        )
+        await session.commit()
+    return operation_id
+
+
+@pytest.mark.asyncio
+async def test_outbox_worker_delivers_once_and_records_audit(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("LIVE_ADVERTISING_ENABLED", "true")
+    engine = create_async_engine(os.environ["DATABASE_URL"])
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    operation_id = await _seed_outbox(sessions, "success")
+    client = _RecordingMiddleware()
+
+    assert await run_once(client, lease_seconds=30, max_attempts=3, session_factory=sessions) is True
+    assert len(client.payloads) == 1
+    async with sessions() as session:
+        operation = await session.get(OperationModel, operation_id)
+        outbox = await session.scalar(select(OutboxModel).where(OutboxModel.operation_id == operation_id))
+        assert operation is not None and operation.state == "accepted"
+        assert outbox is not None and outbox.state == "published" and outbox.attempts == 1
+        assert await session.scalar(
+            select(func.count()).select_from(AuditEventModel).where(
+                AuditEventModel.operation_id == operation_id,
+                AuditEventModel.action == "campaign.activation.dispatched",
+            )
+        ) == 1
+    assert await run_once(client, lease_seconds=30, max_attempts=3, session_factory=sessions) is False
+    assert len(client.payloads) == 1
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_outbox_worker_retries_then_dead_letters_unknown_outcome(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("LIVE_ADVERTISING_ENABLED", "true")
+    engine = create_async_engine(os.environ["DATABASE_URL"])
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    operation_id = await _seed_outbox(sessions, "failure")
+    client = _RecordingMiddleware(MiddlewareDeliveryError("middleware_outcome_unknown", retryable=True))
+
+    assert await run_once(client, lease_seconds=30, max_attempts=1, session_factory=sessions) is True
+    async with sessions() as session:
+        operation = await session.get(OperationModel, operation_id)
+        outbox = await session.scalar(select(OutboxModel).where(OutboxModel.operation_id == operation_id))
+        assert operation is not None and operation.state == "reconciliation_required"
+        assert outbox is not None and outbox.state == "dead_letter" and outbox.attempts == 1
+        assert outbox.last_error_code == "middleware_outcome_unknown"
+        assert await session.scalar(
+            select(func.count()).select_from(AuditEventModel).where(
+                AuditEventModel.operation_id == operation_id,
+                AuditEventModel.action == "campaign.activation.delivery_failed",
+                AuditEventModel.outcome == "dead_letter",
+            )
+        ) == 1
+    await engine.dispose()
 
 
 @pytest.mark.asyncio

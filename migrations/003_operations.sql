@@ -37,11 +37,13 @@ CREATE TABLE IF NOT EXISTS marketing_outbox (
   state varchar(32) NOT NULL DEFAULT 'pending',
   attempts integer NOT NULL DEFAULT 0 CHECK (attempts >= 0),
   next_attempt_at timestamptz NOT NULL DEFAULT now(),
+  lease_until timestamptz,
+  last_error_code varchar(80),
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS ix_marketing_outbox_claim
-  ON marketing_outbox(state, next_attempt_at, created_at);
+  ON marketing_outbox(state, next_attempt_at, lease_until, created_at);
 CREATE INDEX IF NOT EXISTS ix_marketing_outbox_tenant
   ON marketing_outbox(tenant_id, state);
 
