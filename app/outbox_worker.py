@@ -78,7 +78,11 @@ async def complete(claim: Claim, result: dict[str, object], *, session_factory=S
             return
         row.state = "published"
         row.lease_until = None
-        operation.state = "accepted"
+        # A concurrently completed approval-invalidated stop may have retired an
+        # activation while its original delivery call was in flight. Preserve
+        # that terminal supersession instead of resurrecting it as accepted.
+        if operation.state != "superseded":
+            operation.state = "accepted"
         operation.result_json = json.dumps(result, sort_keys=True, separators=(",", ":"))
         if operation.kind == "campaign.approval_invalidation_stop":
             prior_activations = await session.scalars(
@@ -175,17 +179,27 @@ async def run_once(
         )
         return True
     async with session_factory() as session:
+        operation = await session.scalar(
+            select(OperationModel).where(OperationModel.id == item.operation_id)
+        )
         campaign = await session.scalar(
             select(CampaignModel).where(
                 CampaignModel.id == campaign_id,
                 CampaignModel.tenant_id == str(item.payload.get("tenant_id", "")),
             ).with_for_update()
         )
-        if (
-            campaign is None
-            or campaign.state != expected_state
-            or campaign.resource_version != expected_version
-        ):
+        approval_stop = (
+            operation is not None and operation.kind == "campaign.approval_invalidation_stop"
+        )
+        valid = campaign is not None and (
+            (approval_stop and campaign.state == "draft")
+            or (
+                not approval_stop
+                and campaign.state == expected_state
+                and campaign.resource_version == expected_version
+            )
+        )
+        if not valid:
             delivery_error = MiddlewareDeliveryError("campaign_approval_stale", retryable=False)
             result = None
         else:

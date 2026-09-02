@@ -477,6 +477,7 @@ async def test_live_campaign_allows_only_one_activation_operation(monkeypatch):
 @pytest.mark.asyncio
 async def test_material_edit_queues_stop_for_accepted_activation(monkeypatch):
     monkeypatch.setattr("app.main.LIVE_ADVERTISING_ENABLED", True)
+    monkeypatch.setenv("LIVE_ADVERTISING_ENABLED", "true")
     engine = create_async_engine(os.environ["DATABASE_URL"])
     sessions = async_sessionmaker(engine, expire_on_commit=False)
     tenant_id = f"tenant-stop-on-edit-{uuid.uuid4()}"
@@ -510,8 +511,10 @@ async def test_material_edit_queues_stop_for_accepted_activation(monkeypatch):
                 state="published",
             )
         )
+        await session.flush()
         await session.commit()
         campaign_id = campaign.id
+        activation_id = activation.id
         version = campaign.resource_version
     async with sessions() as session:
         updated = await update_campaign(
@@ -532,16 +535,14 @@ async def test_material_edit_queues_stop_for_accepted_activation(monkeypatch):
         assert payload["action"] == "pause"
         assert payload["expected_state"] == "approved"
         assert "reason" not in payload
-        outbox.state = "processing"
-        outbox.attempts = 1
         await session.commit()
         stop_id = stop.id
-        stop_outbox_id = outbox.id
-    await complete(
-        Claim(stop_outbox_id, stop_id, payload, 1),
-        {"operation_id": str(stop_id), "state": "accepted"},
-        session_factory=sessions,
-    )
+    client = _RecordingMiddleware()
+    for _ in range(50):
+        if payload in client.payloads:
+            break
+        assert await run_once(client, lease_seconds=30, max_attempts=3, session_factory=sessions) is True
+    assert payload in client.payloads
     async with sessions() as session:
         activation = await session.scalar(
             select(OperationModel).where(
@@ -550,6 +551,28 @@ async def test_material_edit_queues_stop_for_accepted_activation(monkeypatch):
             )
         )
         assert activation.state == "superseded"
+        stop = await session.get(OperationModel, stop_id)
+        assert stop is not None and stop.state == "accepted"
+
+        # Model an activation response arriving after the invalidation stop.
+        # Its lease is otherwise valid, but it must not resurrect the operation.
+        activation_outbox = await session.scalar(
+            select(OutboxModel).where(OutboxModel.operation_id == activation_id).with_for_update()
+        )
+        assert activation_outbox is not None
+        activation_outbox.state = "processing"
+        activation_outbox.attempts = 1
+        activation_payload = json.loads(activation_outbox.payload_json)
+        activation_outbox_id = activation_outbox.id
+        await session.commit()
+    await complete(
+        Claim(activation_outbox_id, activation_id, activation_payload, 1),
+        {"operation_id": str(activation_id), "state": "accepted"},
+        session_factory=sessions,
+    )
+    async with sessions() as session:
+        activation = await session.get(OperationModel, activation_id)
+        assert activation is not None and activation.state == "superseded"
     await engine.dispose()
 
 
