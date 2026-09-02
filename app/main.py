@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import asyncio
+import re
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Annotated, Any
@@ -42,6 +43,7 @@ META_ALLOWED_AD_ACCOUNT_IDS = {
     if value.strip()
 }
 SERVICE = "codestra-marketing"
+CORRELATION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
 REQUEST_COUNT = Counter(
     "codestra_marketing_http_requests_total",
     "Marketing API requests",
@@ -56,7 +58,15 @@ REQUEST_LATENCY = Histogram(
 
 @app.middleware("http")
 async def operational_headers(request: Request, call_next):
-    correlation_id = request.headers.get("X-Correlation-ID") or str(uuid4())
+    supplied_correlation_id = request.headers.get("X-Correlation-ID", "").strip()
+    if supplied_correlation_id and not CORRELATION_RE.fullmatch(supplied_correlation_id):
+        correlation_id = str(uuid4())
+        return JSONResponse(
+            status_code=400,
+            content={"detail": "invalid_correlation_id", "correlation_id": correlation_id},
+            headers={"Cache-Control": "no-store", "X-Correlation-ID": correlation_id},
+        )
+    correlation_id = supplied_correlation_id or str(uuid4())
     request.state.correlation_id = correlation_id
     started = asyncio.get_running_loop().time()
     try:
@@ -477,7 +487,7 @@ async def activate_campaign(
                     tenant_id=x_tenant_id,
                     operation_id=operation.id,
                     destination="middleware",
-                    event_type="marketing.campaign.activation.requested",
+                    event_type="marketing.campaign.activation_requested",
                     payload_json=json.dumps(
                         {
                             "operation_id": str(operation.id),

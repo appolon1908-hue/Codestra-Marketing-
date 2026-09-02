@@ -30,6 +30,7 @@ class _Jwks:
 async def test_verified_keycloak_claims_bind_principal_to_tenant(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("KEYCLOAK_ISSUER", "https://identity.example/realms/codestra")
     monkeypatch.setenv("KEYCLOAK_AUDIENCE", "marketing-service")
+    monkeypatch.setenv("KEYCLOAK_ALLOWED_CLIENT_IDS", "codestra-console,marketing-service")
     monkeypatch.setattr(auth, "_jwk_client", lambda _url: _Jwks())
     monkeypatch.setattr(
         auth.jwt,
@@ -57,6 +58,7 @@ async def test_verified_keycloak_claims_bind_principal_to_tenant(monkeypatch: py
 async def test_tenant_header_must_match_verified_claim(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("KEYCLOAK_ISSUER", "https://identity.example/realms/codestra")
     monkeypatch.setenv("KEYCLOAK_AUDIENCE", "marketing-service")
+    monkeypatch.setenv("KEYCLOAK_ALLOWED_CLIENT_IDS", "codestra-console,marketing-service")
     monkeypatch.setattr(auth, "_jwk_client", lambda _url: _Jwks())
     monkeypatch.setattr(
         auth.jwt,
@@ -94,4 +96,29 @@ def test_request_body_cannot_spoof_approval_actor() -> None:
     principal = auth.Principal("operator-1", "tenant-1", frozenset({"marketing.approve"}), None)
     with pytest.raises(HTTPException, match="actor_identity_mismatch") as denied:
         _bind_actor(principal, "different-operator")
+    assert denied.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_unapproved_authorized_party_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("KEYCLOAK_ISSUER", "https://identity.example/realms/codestra")
+    monkeypatch.setenv("KEYCLOAK_AUDIENCE", "marketing-service")
+    monkeypatch.setenv("KEYCLOAK_ALLOWED_CLIENT_IDS", "codestra-console")
+    monkeypatch.setattr(auth, "_jwk_client", lambda _url: _Jwks())
+    monkeypatch.setattr(
+        auth.jwt,
+        "decode",
+        lambda *_args, **_kwargs: {
+            "sub": "operator-1",
+            "tenant_id": "tenant-1",
+            "scope": "marketing.read",
+            "azp": "unapproved-client",
+        },
+    )
+    with pytest.raises(HTTPException, match="client_not_authorized") as denied:
+        await auth.authenticate(
+            _Request(),  # type: ignore[arg-type]
+            "tenant-1",
+            HTTPAuthorizationCredentials(scheme="Bearer", credentials="signed-token"),
+        )
     assert denied.value.status_code == 403

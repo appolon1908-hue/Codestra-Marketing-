@@ -90,11 +90,18 @@ async def authenticate(
         raise HTTPException(status_code=403, detail="tenant_mismatch")
 
     client_id = claims.get("azp")
+    allowed_clients = {
+        value.strip()
+        for value in _required_setting("KEYCLOAK_ALLOWED_CLIENT_IDS").split(",")
+        if value.strip()
+    }
+    if not isinstance(client_id, str) or client_id not in allowed_clients:
+        raise HTTPException(status_code=403, detail="client_not_authorized")
     principal = Principal(
         subject=subject,
         tenant_id=tenant_id,
         scopes=_scopes(claims),
-        client_id=client_id if isinstance(client_id, str) else None,
+        client_id=client_id,
     )
     request.state.principal = principal
     return principal

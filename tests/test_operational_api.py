@@ -46,3 +46,11 @@ async def test_metrics_are_private_and_not_in_openapi():
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         response = await client.get("/metrics")
     assert response.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_oversized_correlation_id_is_rejected_before_persistence():
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get("/health", headers={"X-Correlation-ID": "x" * 129})
+    assert response.status_code == 400
+    assert response.json()["detail"] == "invalid_correlation_id"
