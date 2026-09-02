@@ -80,6 +80,19 @@ async def complete(claim: Claim, result: dict[str, object], *, session_factory=S
         row.lease_until = None
         operation.state = "accepted"
         operation.result_json = json.dumps(result, sort_keys=True, separators=(",", ":"))
+        if operation.kind == "campaign.approval_invalidation_stop":
+            prior_activations = await session.scalars(
+                select(OperationModel)
+                .where(
+                    OperationModel.tenant_id == operation.tenant_id,
+                    OperationModel.aggregate_id == operation.aggregate_id,
+                    OperationModel.kind == "campaign.activate",
+                    OperationModel.state.in_({"pending", "processing", "accepted", "reconciliation_required"}),
+                )
+                .with_for_update()
+            )
+            for prior_activation in prior_activations:
+                prior_activation.state = "superseded"
         action = str(claim.payload.get("action", "activate"))
         audit_action = "activation" if action == "activate" else action
         session.add(

@@ -43,7 +43,7 @@ from app.main import (
 )
 from app.models import AuditEventModel, CampaignModel, OperationModel, OutboxModel
 from app.middleware_client import MiddlewareDeliveryError
-from app.outbox_worker import claim_one, complete, run_once
+from app.outbox_worker import Claim, claim_one, complete, run_once
 
 pytestmark = pytest.mark.postgres
 
@@ -494,6 +494,22 @@ async def test_material_edit_queues_stop_for_accepted_activation(monkeypatch):
             correlation_id=f"corr-{uuid.uuid4()}", result_json="{}",
         )
         session.add(activation)
+        await session.flush()
+        session.add(
+            OutboxModel(
+                tenant_id=tenant_id, operation_id=activation.id, destination="middleware",
+                event_type="marketing.campaign.activation_requested",
+                payload_json=json.dumps(
+                    {
+                        "operation_id": str(activation.id), "campaign_id": str(campaign.id),
+                        "action": "activate", "expected_state": "approved",
+                        "expected_version": campaign.resource_version, "tenant_id": tenant_id,
+                        "correlation_id": activation.correlation_id,
+                    }
+                ),
+                state="published",
+            )
+        )
         await session.commit()
         campaign_id = campaign.id
         version = campaign.resource_version
@@ -512,7 +528,28 @@ async def test_material_edit_queues_stop_for_accepted_activation(monkeypatch):
         assert stop is not None and stop.state == "pending"
         outbox = await session.scalar(select(OutboxModel).where(OutboxModel.operation_id == stop.id))
         assert outbox is not None
-        assert json.loads(outbox.payload_json)["action"] == "pause"
+        payload = json.loads(outbox.payload_json)
+        assert payload["action"] == "pause"
+        assert payload["expected_state"] == "approved"
+        assert "reason" not in payload
+        outbox.state = "processing"
+        outbox.attempts = 1
+        await session.commit()
+        stop_id = stop.id
+        stop_outbox_id = outbox.id
+    await complete(
+        Claim(stop_outbox_id, stop_id, payload, 1),
+        {"operation_id": str(stop_id), "state": "accepted"},
+        session_factory=sessions,
+    )
+    async with sessions() as session:
+        activation = await session.scalar(
+            select(OperationModel).where(
+                OperationModel.tenant_id == tenant_id,
+                OperationModel.kind == "campaign.activate",
+            )
+        )
+        assert activation.state == "superseded"
     await engine.dispose()
 
 

@@ -598,6 +598,15 @@ async def update_campaign(
             )
         )
         if activation is not None:
+            activation_outbox = await session.scalar(
+                select(OutboxModel).where(OutboxModel.operation_id == activation.id)
+            )
+            if activation_outbox is None:
+                raise RuntimeError("activation outbox evidence missing")
+            try:
+                activated_version = int(json.loads(activation_outbox.payload_json)["expected_version"])
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise RuntimeError("activation version evidence invalid") from exc
             stop_key = "system-stop-" + hashlib.sha256(
                 f"{idempotency_key}:approval-invalidation-stop".encode()
             ).hexdigest()
@@ -607,7 +616,7 @@ async def update_campaign(
                 kind="campaign.approval_invalidation_stop",
                 tenant_id=x_tenant_id,
                 idempotency_key=stop_key,
-                payload={"expected_version": row.resource_version, "expected_state": row.state},
+                payload={"expected_version": activated_version, "expected_state": "approved"},
                 principal=principal,
                 correlation_id=request.state.correlation_id,
                 outcome="pending",
@@ -632,9 +641,8 @@ async def update_campaign(
                             "operation_id": str(stop_operation.id),
                             "campaign_id": str(campaign_id),
                             "action": "pause",
-                            "reason": "approval_invalidated",
-                            "expected_state": row.state,
-                            "expected_version": row.resource_version,
+                            "expected_state": "approved",
+                            "expected_version": activated_version,
                             "tenant_id": x_tenant_id,
                             "correlation_id": request.state.correlation_id,
                         },
