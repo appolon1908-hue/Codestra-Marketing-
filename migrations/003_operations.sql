@@ -1,5 +1,8 @@
 -- rollback: 003_operations.down.sql
 ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS resource_version integer NOT NULL DEFAULT 1;
+ALTER TABLE audiences ADD COLUMN IF NOT EXISTS resource_version integer NOT NULL DEFAULT 1;
+ALTER TABLE creatives ADD COLUMN IF NOT EXISTS resource_version integer NOT NULL DEFAULT 1;
+ALTER TABLE creatives ADD COLUMN IF NOT EXISTS approval_requested_by varchar(128);
 CREATE TABLE IF NOT EXISTS marketing_operations (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   tenant_id varchar(64) NOT NULL,

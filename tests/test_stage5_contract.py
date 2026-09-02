@@ -16,7 +16,12 @@ def test_canonical_stage5_routes_are_registered_without_legacy_drift():
         "/v1/marketing/campaigns/{campaign_id}/activate",
         "/v1/marketing/operations/{operation_id}",
         "/v1/marketing/audiences",
+        "/v1/marketing/audiences/{audience_id}",
         "/v1/marketing/creatives",
+        "/v1/marketing/creatives/{creative_id}",
+        "/v1/marketing/creatives/{creative_id}/submit-for-approval",
+        "/v1/marketing/creatives/{creative_id}/approve",
+        "/v1/marketing/creatives/{creative_id}/reject",
         "/v1/marketing/providers/meta/accounts/{ad_account_id}/campaigns",
     }
     assert required.issubset(paths)

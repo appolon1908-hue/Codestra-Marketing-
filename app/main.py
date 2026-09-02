@@ -139,6 +139,14 @@ class Audience(BaseModel):
     tenant_id: str
     name: str
     definition: dict[str, Any]
+    resource_version: int
+
+
+class AudienceUpdate(BaseModel):
+    model_config = {"extra": "forbid"}
+    expected_version: int = Field(ge=1)
+    name: str | None = Field(default=None, min_length=1, max_length=160)
+    definition: dict[str, Any] | None = None
 
 
 class CreativeCreate(BaseModel):
@@ -153,6 +161,14 @@ class Creative(BaseModel):
     name: str
     content: dict[str, Any]
     approval_state: str
+    resource_version: int
+
+
+class CreativeUpdate(BaseModel):
+    model_config = {"extra": "forbid"}
+    expected_version: int = Field(ge=1)
+    name: str | None = Field(default=None, min_length=1, max_length=160)
+    content: dict[str, Any] | None = None
 
 
 class Operation(BaseModel):
@@ -178,6 +194,27 @@ def _operation_response(row: OperationModel) -> Operation:
         attempts=row.attempts,
         error_code=row.error_code,
         status_url=f"/v1/marketing/operations/{row.id}",
+    )
+
+
+def _audience_response(row: AudienceModel) -> Audience:
+    return Audience(
+        id=row.id,
+        tenant_id=row.tenant_id,
+        name=row.name,
+        definition=json.loads(row.definition_json),
+        resource_version=row.resource_version,
+    )
+
+
+def _creative_response(row: CreativeModel) -> Creative:
+    return Creative(
+        id=row.id,
+        tenant_id=row.tenant_id,
+        name=row.name,
+        content=json.loads(row.content_json),
+        approval_state=row.approval_state,
+        resource_version=row.resource_version,
     )
 
 
@@ -246,6 +283,7 @@ async def _record_mutation(
     principal: Principal,
     correlation_id: str,
     outcome: str = "completed",
+    aggregate_type: str = "campaign",
 ) -> bool:
     fingerprint = _fingerprint(kind, tenant_id, payload)
     result = await session.execute(
@@ -277,7 +315,7 @@ async def _record_mutation(
         AuditEventModel(
             tenant_id=tenant_id,
             operation_id=operation.id,
-            aggregate_type="campaign",
+            aggregate_type=aggregate_type,
             aggregate_id=aggregate_id,
             action=kind,
             outcome=outcome,
@@ -844,7 +882,74 @@ async def create_audience(
         session.add(row)
         await session.commit()
         await session.refresh(row)
-    return Audience(id=row.id, tenant_id=row.tenant_id, name=row.name, definition=json.loads(row.definition_json))
+    return _audience_response(row)
+
+
+@router.get("/audiences", response_model=list[Audience])
+async def list_audiences(
+    request: Request,
+    x_tenant_id: TenantHeader,
+    session: AsyncSession = Depends(get_session),
+) -> list[Audience]:
+    _principal(request).require("marketing.read")
+    rows = (
+        await session.execute(
+            select(AudienceModel).where(AudienceModel.tenant_id == x_tenant_id).order_by(AudienceModel.name)
+        )
+    ).scalars().all()
+    return [_audience_response(row) for row in rows]
+
+
+@router.get("/audiences/{audience_id}", response_model=Audience)
+async def get_audience(
+    audience_id: UUID,
+    request: Request,
+    x_tenant_id: TenantHeader,
+    session: AsyncSession = Depends(get_session),
+) -> Audience:
+    _principal(request).require("marketing.read")
+    row = await session.scalar(
+        select(AudienceModel).where(AudienceModel.id == audience_id, AudienceModel.tenant_id == x_tenant_id)
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="audience_not_found")
+    return _audience_response(row)
+
+
+@router.patch("/audiences/{audience_id}", response_model=Audience)
+async def update_audience(
+    audience_id: UUID,
+    body: AudienceUpdate,
+    request: Request,
+    x_tenant_id: TenantHeader,
+    idempotency_key: IdempotencyHeader,
+    session: AsyncSession = Depends(get_session),
+) -> Audience:
+    principal = _principal(request)
+    principal.require("marketing.write")
+    row = await session.scalar(
+        select(AudienceModel)
+        .where(AudienceModel.id == audience_id, AudienceModel.tenant_id == x_tenant_id)
+        .with_for_update()
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="audience_not_found")
+    if not await _record_mutation(
+        session, aggregate_id=audience_id, kind="audience.update", tenant_id=x_tenant_id,
+        idempotency_key=idempotency_key, payload=body.model_dump(mode="json"), principal=principal,
+        correlation_id=request.state.correlation_id, aggregate_type="audience",
+    ):
+        return _audience_response(row)
+    if row.resource_version != body.expected_version:
+        raise HTTPException(status_code=409, detail="stale_resource_version")
+    if body.name is not None:
+        row.name = body.name
+    if body.definition is not None:
+        row.definition_json = json.dumps(body.definition, sort_keys=True, separators=(",", ":"))
+    row.resource_version += 1
+    await session.commit()
+    await session.refresh(row)
+    return _audience_response(row)
 
 
 @router.post("/creatives", response_model=Creative, status_code=status.HTTP_201_CREATED)
@@ -881,12 +986,157 @@ async def create_creative(
         session.add(row)
         await session.commit()
         await session.refresh(row)
-    return Creative(
-        id=row.id,
-        tenant_id=row.tenant_id,
-        name=row.name,
-        content=json.loads(row.content_json),
-        approval_state=row.approval_state,
+    return _creative_response(row)
+
+
+@router.get("/creatives", response_model=list[Creative])
+async def list_creatives(
+    request: Request,
+    x_tenant_id: TenantHeader,
+    session: AsyncSession = Depends(get_session),
+) -> list[Creative]:
+    _principal(request).require("marketing.read")
+    rows = (
+        await session.execute(
+            select(CreativeModel).where(CreativeModel.tenant_id == x_tenant_id).order_by(CreativeModel.name)
+        )
+    ).scalars().all()
+    return [_creative_response(row) for row in rows]
+
+
+@router.get("/creatives/{creative_id}", response_model=Creative)
+async def get_creative(
+    creative_id: UUID,
+    request: Request,
+    x_tenant_id: TenantHeader,
+    session: AsyncSession = Depends(get_session),
+) -> Creative:
+    _principal(request).require("marketing.read")
+    row = await session.scalar(
+        select(CreativeModel).where(CreativeModel.id == creative_id, CreativeModel.tenant_id == x_tenant_id)
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="creative_not_found")
+    return _creative_response(row)
+
+
+@router.patch("/creatives/{creative_id}", response_model=Creative)
+async def update_creative(
+    creative_id: UUID,
+    body: CreativeUpdate,
+    request: Request,
+    x_tenant_id: TenantHeader,
+    idempotency_key: IdempotencyHeader,
+    session: AsyncSession = Depends(get_session),
+) -> Creative:
+    principal = _principal(request)
+    principal.require("marketing.write")
+    row = await session.scalar(
+        select(CreativeModel)
+        .where(CreativeModel.id == creative_id, CreativeModel.tenant_id == x_tenant_id)
+        .with_for_update()
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="creative_not_found")
+    if not await _record_mutation(
+        session, aggregate_id=creative_id, kind="creative.update", tenant_id=x_tenant_id,
+        idempotency_key=idempotency_key, payload=body.model_dump(mode="json"), principal=principal,
+        correlation_id=request.state.correlation_id, aggregate_type="creative",
+    ):
+        return _creative_response(row)
+    if row.resource_version != body.expected_version:
+        raise HTTPException(status_code=409, detail="stale_resource_version")
+    if body.name is not None:
+        row.name = body.name
+    if body.content is not None:
+        row.content_json = json.dumps(body.content, sort_keys=True, separators=(",", ":"))
+        row.approval_state = "draft"
+        row.approval_requested_by = None
+    row.resource_version += 1
+    await session.commit()
+    await session.refresh(row)
+    return _creative_response(row)
+
+
+async def _transition_creative(
+    creative_id: UUID,
+    body: ApprovalAction,
+    request: Request,
+    tenant_id: str,
+    idempotency_key: str,
+    session: AsyncSession,
+    *,
+    action: str,
+    required_scope: str,
+    from_state: str,
+    to_state: str,
+) -> Creative:
+    principal = _principal(request)
+    principal.require(required_scope)
+    _bind_actor(principal, body.actor_id)
+    row = await session.scalar(
+        select(CreativeModel)
+        .where(CreativeModel.id == creative_id, CreativeModel.tenant_id == tenant_id)
+        .with_for_update()
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="creative_not_found")
+    if not await _record_mutation(
+        session, aggregate_id=creative_id, kind=action, tenant_id=tenant_id,
+        idempotency_key=idempotency_key, payload=body.model_dump(mode="json"), principal=principal,
+        correlation_id=request.state.correlation_id, aggregate_type="creative",
+    ):
+        return _creative_response(row)
+    if row.resource_version != body.expected_version:
+        raise HTTPException(status_code=409, detail="stale_resource_version")
+    if row.approval_state != from_state:
+        raise HTTPException(status_code=409, detail="invalid_creative_state")
+    if action in {"creative.approve", "creative.reject"}:
+        if row.approval_requested_by == principal.subject:
+            raise HTTPException(status_code=409, detail="approval_separation_of_duties_required")
+        if not row.approval_requested_by:
+            raise HTTPException(status_code=409, detail="approval_requester_missing")
+    row.approval_state = to_state
+    row.approval_requested_by = principal.subject if action == "creative.submit_for_approval" else None
+    row.resource_version += 1
+    await session.commit()
+    await session.refresh(row)
+    return _creative_response(row)
+
+
+@router.post("/creatives/{creative_id}/submit-for-approval", response_model=Creative)
+async def submit_creative_for_approval(
+    creative_id: UUID, body: ApprovalAction, request: Request, x_tenant_id: TenantHeader,
+    idempotency_key: IdempotencyHeader, session: AsyncSession = Depends(get_session),
+) -> Creative:
+    return await _transition_creative(
+        creative_id, body, request, x_tenant_id, idempotency_key, session,
+        action="creative.submit_for_approval", required_scope="marketing.write",
+        from_state="draft", to_state="pending_approval",
+    )
+
+
+@router.post("/creatives/{creative_id}/approve", response_model=Creative)
+async def approve_creative(
+    creative_id: UUID, body: ApprovalAction, request: Request, x_tenant_id: TenantHeader,
+    idempotency_key: IdempotencyHeader, session: AsyncSession = Depends(get_session),
+) -> Creative:
+    return await _transition_creative(
+        creative_id, body, request, x_tenant_id, idempotency_key, session,
+        action="creative.approve", required_scope="marketing.approve",
+        from_state="pending_approval", to_state="approved",
+    )
+
+
+@router.post("/creatives/{creative_id}/reject", response_model=Creative)
+async def reject_creative(
+    creative_id: UUID, body: ApprovalAction, request: Request, x_tenant_id: TenantHeader,
+    idempotency_key: IdempotencyHeader, session: AsyncSession = Depends(get_session),
+) -> Creative:
+    return await _transition_creative(
+        creative_id, body, request, x_tenant_id, idempotency_key, session,
+        action="creative.reject", required_scope="marketing.approve",
+        from_state="pending_approval", to_state="draft",
     )
 
 

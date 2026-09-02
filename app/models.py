@@ -57,6 +57,7 @@ class AudienceModel(Base):
     definition_json: Mapped[str] = mapped_column(Text)
     idempotency_key: Mapped[str] = mapped_column(String(200))
     request_fingerprint: Mapped[str] = mapped_column(String(64))
+    resource_version: Mapped[int] = mapped_column(Integer, default=1)
 
     __table_args__ = (UniqueConstraint("tenant_id", "idempotency_key", name="uq_audience_idempotency"),)
 
@@ -71,6 +72,8 @@ class CreativeModel(Base):
     approval_state: Mapped[str] = mapped_column(String(24), default="draft")
     idempotency_key: Mapped[str] = mapped_column(String(200))
     request_fingerprint: Mapped[str] = mapped_column(String(64))
+    resource_version: Mapped[int] = mapped_column(Integer, default=1)
+    approval_requested_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
     __table_args__ = (UniqueConstraint("tenant_id", "idempotency_key", name="uq_creative_idempotency"),)
 

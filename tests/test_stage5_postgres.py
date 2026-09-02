@@ -12,16 +12,28 @@ from starlette.requests import Request
 from app.auth import Principal
 from app.main import (
     ApprovalAction,
+    AudienceCreate,
+    AudienceUpdate,
     CampaignCreate,
     CampaignUpdate,
+    CreativeCreate,
+    CreativeUpdate,
     activate_campaign,
     approve_campaign,
+    approve_creative,
+    create_audience,
     create_campaign,
+    create_creative,
+    get_audience,
+    get_creative,
     get_campaign,
     pause_campaign,
     resume_campaign,
     submit_for_approval,
+    submit_creative_for_approval,
+    update_audience,
     update_campaign,
+    update_creative,
 )
 from app.models import AuditEventModel, CampaignModel, OperationModel, OutboxModel
 
@@ -57,6 +69,57 @@ async def test_idempotency_and_cross_tenant_reads_fail_closed():
         with pytest.raises(HTTPException) as denied:
             await get_campaign(first_id, tenant_b, session)
         assert denied.value.status_code == 404
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_audience_and_creative_lifecycles_are_tenant_scoped_and_versioned():
+    engine = create_async_engine(os.environ["DATABASE_URL"])
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    tenant_id = f"tenant-assets-{uuid.uuid4()}"
+    other_tenant = f"tenant-other-{uuid.uuid4()}"
+    writer = _request(tenant_id, "writer-1", {"marketing.write"})
+    approver = _request(tenant_id, "approver-1", {"marketing.approve"})
+    async with sessions() as session:
+        audience = await create_audience(
+            AudienceCreate(name="Audience", definition={"country": "DO"}),
+            tenant_id, "audience-create", session,
+        )
+        creative = await create_creative(
+            CreativeCreate(name="Creative", content={"headline": "Synthetic"}),
+            tenant_id, "creative-create", session,
+        )
+    async with sessions() as session:
+        audience = await update_audience(
+            audience.id, AudienceUpdate(expected_version=audience.resource_version, name="Audience v2"),
+            writer, tenant_id, "audience-update", session,
+        )
+        creative = await update_creative(
+            creative.id, CreativeUpdate(expected_version=creative.resource_version, name="Creative v2"),
+            writer, tenant_id, "creative-update", session,
+        )
+    async with sessions() as session:
+        creative = await submit_creative_for_approval(
+            creative.id,
+            ApprovalAction(actor_id="writer-1", expected_version=creative.resource_version),
+            writer, tenant_id, "creative-submit", session,
+        )
+    async with sessions() as session:
+        creative = await approve_creative(
+            creative.id,
+            ApprovalAction(actor_id="approver-1", expected_version=creative.resource_version),
+            approver, tenant_id, "creative-approve", session,
+        )
+        assert audience.name == "Audience v2"
+        assert creative.approval_state == "approved"
+    async with sessions() as session:
+        with pytest.raises(HTTPException) as hidden_audience:
+            await get_audience(audience.id, _request(other_tenant, "reader", {"marketing.read"}), other_tenant, session)
+        assert hidden_audience.value.status_code == 404
+        with pytest.raises(HTTPException) as hidden_creative:
+            await get_creative(creative.id, _request(other_tenant, "reader", {"marketing.read"}), other_tenant, session)
+        assert hidden_creative.value.status_code == 404
 
     await engine.dispose()
 
