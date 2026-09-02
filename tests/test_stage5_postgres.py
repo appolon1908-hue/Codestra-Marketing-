@@ -475,6 +475,93 @@ async def test_live_campaign_allows_only_one_activation_operation(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_material_edit_queues_stop_for_accepted_activation(monkeypatch):
+    monkeypatch.setattr("app.main.LIVE_ADVERTISING_ENABLED", True)
+    engine = create_async_engine(os.environ["DATABASE_URL"])
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    tenant_id = f"tenant-stop-on-edit-{uuid.uuid4()}"
+    writer = _request(tenant_id, "writer", {"marketing.write"})
+    async with sessions() as session:
+        campaign = await create_campaign(
+            CampaignCreate(name="Live campaign", objective="leads", daily_budget_minor=100),
+            tenant_id, f"create-{uuid.uuid4()}", session,
+        )
+        campaign.state = "approved"
+        activation = OperationModel(
+            tenant_id=tenant_id, kind="campaign.activate", aggregate_id=campaign.id,
+            state="accepted", idempotency_key=f"activate-{uuid.uuid4()}",
+            request_fingerprint="0" * 64, requested_by="operator",
+            correlation_id=f"corr-{uuid.uuid4()}", result_json="{}",
+        )
+        session.add(activation)
+        await session.commit()
+        campaign_id = campaign.id
+        version = campaign.resource_version
+    async with sessions() as session:
+        updated = await update_campaign(
+            campaign_id, CampaignUpdate(expected_version=version, daily_budget_minor=200),
+            writer, tenant_id, f"update-{uuid.uuid4()}", session,
+        )
+        assert updated.state == "draft"
+        stop = await session.scalar(
+            select(OperationModel).where(
+                OperationModel.tenant_id == tenant_id,
+                OperationModel.kind == "campaign.approval_invalidation_stop",
+            )
+        )
+        assert stop is not None and stop.state == "pending"
+        outbox = await session.scalar(select(OutboxModel).where(OutboxModel.operation_id == stop.id))
+        assert outbox is not None
+        assert json.loads(outbox.payload_json)["action"] == "pause"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_pause_propagates_while_activation_completion_is_pending(monkeypatch):
+    monkeypatch.setattr("app.main.LIVE_ADVERTISING_ENABLED", True)
+    engine = create_async_engine(os.environ["DATABASE_URL"])
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    tenant_id = f"tenant-pause-pending-{uuid.uuid4()}"
+    writer = _request(tenant_id, "writer", {"marketing.write"})
+    async with sessions() as session:
+        campaign = await create_campaign(
+            CampaignCreate(name="Pending activation", objective="leads", daily_budget_minor=100),
+            tenant_id, f"create-{uuid.uuid4()}", session,
+        )
+        campaign.state = "approved"
+        session.add(
+            OperationModel(
+                tenant_id=tenant_id, kind="campaign.activate", aggregate_id=campaign.id,
+                state="pending", idempotency_key=f"activate-{uuid.uuid4()}",
+                request_fingerprint="0" * 64, requested_by="operator",
+                correlation_id=f"corr-{uuid.uuid4()}", result_json="{}",
+            )
+        )
+        await session.commit()
+        campaign_id = campaign.id
+        version = campaign.resource_version
+    async with sessions() as session:
+        paused = await pause_campaign(
+            campaign_id, ApprovalAction(actor_id="writer", expected_version=version),
+            writer, tenant_id, f"pause-{uuid.uuid4()}", session,
+        )
+        assert paused.state == "paused"
+        pause_operation = await session.scalar(
+            select(OperationModel).where(
+                OperationModel.tenant_id == tenant_id,
+                OperationModel.kind == "campaign.pause",
+            )
+        )
+        assert pause_operation is not None and pause_operation.state == "pending"
+        assert await session.scalar(
+            select(func.count()).select_from(OutboxModel).where(
+                OutboxModel.operation_id == pause_operation.id
+            )
+        ) == 1
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_attribution_is_tenant_scoped_idempotent_and_reporting_is_bounded():
     engine = create_async_engine(os.environ["DATABASE_URL"])
     sessions = async_sessionmaker(engine, expire_on_commit=False)

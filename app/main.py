@@ -588,6 +588,61 @@ async def update_campaign(
             approval.reason = "campaign_materially_changed"
         row.state = CampaignState.DRAFT.value
     row.resource_version += 1
+    if changed_approval_input and LIVE_ADVERTISING_ENABLED:
+        activation = await session.scalar(
+            select(OperationModel).where(
+                OperationModel.tenant_id == x_tenant_id,
+                OperationModel.aggregate_id == campaign_id,
+                OperationModel.kind == "campaign.activate",
+                OperationModel.state.in_({"pending", "processing", "accepted", "reconciliation_required"}),
+            )
+        )
+        if activation is not None:
+            stop_key = "system-stop-" + hashlib.sha256(
+                f"{idempotency_key}:approval-invalidation-stop".encode()
+            ).hexdigest()
+            await _record_mutation(
+                session,
+                aggregate_id=campaign_id,
+                kind="campaign.approval_invalidation_stop",
+                tenant_id=x_tenant_id,
+                idempotency_key=stop_key,
+                payload={"expected_version": row.resource_version, "expected_state": row.state},
+                principal=principal,
+                correlation_id=request.state.correlation_id,
+                outcome="pending",
+            )
+            stop_operation = await session.scalar(
+                select(OperationModel).where(
+                    OperationModel.tenant_id == x_tenant_id,
+                    OperationModel.kind == "campaign.approval_invalidation_stop",
+                    OperationModel.idempotency_key == stop_key,
+                )
+            )
+            if stop_operation is None:
+                raise RuntimeError("approval invalidation stop operation missing")
+            session.add(
+                OutboxModel(
+                    tenant_id=x_tenant_id,
+                    operation_id=stop_operation.id,
+                    destination="middleware",
+                    event_type="marketing.campaign.approval_invalidated_stop_requested",
+                    payload_json=json.dumps(
+                        {
+                            "operation_id": str(stop_operation.id),
+                            "campaign_id": str(campaign_id),
+                            "action": "pause",
+                            "reason": "approval_invalidated",
+                            "expected_state": row.state,
+                            "expected_version": row.resource_version,
+                            "tenant_id": x_tenant_id,
+                            "correlation_id": request.state.correlation_id,
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                )
+            )
     await session.commit()
     await session.refresh(row)
     return row
@@ -750,7 +805,7 @@ async def _transition_campaign(
                 OperationModel.tenant_id == tenant_id,
                 OperationModel.aggregate_id == campaign_id,
                 OperationModel.kind == "campaign.activate",
-                OperationModel.state == "accepted",
+                OperationModel.state.in_({"pending", "processing", "accepted", "reconciliation_required"}),
             )
         )
         if prior_activation is not None:
