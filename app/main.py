@@ -34,7 +34,18 @@ from .models import (
 from .providers.meta_read import MetaReadClient
 
 app = FastAPI(title="Codestra Marketing API", version="0.3.0")
-router = APIRouter(prefix="/v1/marketing", dependencies=[Depends(authenticate)])
+
+
+def require_correlation_id(
+    x_correlation_id: Annotated[str, Header(alias="X-Correlation-ID", min_length=8, max_length=128)],
+) -> str:
+    return x_correlation_id
+
+
+router = APIRouter(
+    prefix="/v1/marketing",
+    dependencies=[Depends(authenticate), Depends(require_correlation_id)],
+)
 
 LIVE_ADVERTISING_ENABLED = os.getenv("LIVE_ADVERTISING_ENABLED", "false").lower() == "true"
 META_READ_SYNC_ENABLED = os.getenv("META_READ_SYNC_ENABLED", "false").lower() == "true"

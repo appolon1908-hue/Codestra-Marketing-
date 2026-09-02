@@ -83,7 +83,8 @@ async def complete(claim: Claim, result: dict[str, object], *, session_factory=S
         session.add(
             AuditEventModel(
                 tenant_id=operation.tenant_id, operation_id=operation.id, aggregate_type="campaign",
-                aggregate_id=operation.aggregate_id, action="campaign.activation.dispatched",
+                aggregate_id=operation.aggregate_id,
+                action=f"campaign.{claim.payload.get('action', 'activate')}.dispatched",
                 outcome="accepted", actor_id="marketing-outbox-worker",
                 correlation_id=operation.correlation_id, detail_json="{}",
             )
@@ -120,7 +121,7 @@ async def fail(
                 operation_id=operation.id,
                 aggregate_type="campaign",
                 aggregate_id=operation.aggregate_id,
-                action="campaign.activation.delivery_failed",
+                action=f"campaign.{claim.payload.get('action', 'activate')}.delivery_failed",
                 outcome="dead_letter" if terminal else "retry_scheduled",
                 actor_id="marketing-outbox-worker",
                 correlation_id=operation.correlation_id,
