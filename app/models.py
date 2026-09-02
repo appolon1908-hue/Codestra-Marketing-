@@ -22,6 +22,7 @@ class CampaignModel(Base):
     provider_campaign_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     idempotency_key: Mapped[str] = mapped_column(String(200))
     request_fingerprint: Mapped[str] = mapped_column(String(64))
+    resource_version: Mapped[int] = mapped_column(Integer, default=1)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     approvals: Mapped[list["ApprovalModel"]] = relationship(back_populates="campaign", cascade="all, delete-orphan")

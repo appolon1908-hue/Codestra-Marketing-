@@ -109,12 +109,23 @@ class Campaign(BaseModel):
     daily_budget_minor: int
     currency: str
     state: str
+    resource_version: int
     model_config = {"from_attributes": True}
 
 
 class ApprovalAction(BaseModel):
     actor_id: str = Field(min_length=1, max_length=128)
     reason: str | None = Field(default=None, max_length=2000)
+    expected_version: int = Field(ge=1)
+
+
+class CampaignUpdate(BaseModel):
+    model_config = {"extra": "forbid"}
+    expected_version: int = Field(ge=1)
+    name: str | None = Field(default=None, min_length=1, max_length=160)
+    objective: str | None = Field(default=None, min_length=1, max_length=80)
+    daily_budget_minor: int | None = Field(default=None, ge=0)
+    currency: str | None = Field(default=None, min_length=3, max_length=3)
 
 
 class AudienceCreate(BaseModel):
@@ -208,17 +219,74 @@ def _fingerprint(kind: str, tenant_id: str, payload: dict[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-async def _campaign_for_tenant(session: AsyncSession, campaign_id: UUID, tenant_id: str) -> CampaignModel:
-    result = await session.execute(
-        select(CampaignModel).where(
+async def _campaign_for_tenant(
+    session: AsyncSession, campaign_id: UUID, tenant_id: str, *, lock: bool = False
+) -> CampaignModel:
+    statement = select(CampaignModel).where(
             CampaignModel.id == campaign_id,
             CampaignModel.tenant_id == tenant_id,
         )
-    )
+    if lock:
+        statement = statement.with_for_update()
+    result = await session.execute(statement)
     row = result.scalar_one_or_none()
     if row is None:
         raise HTTPException(status_code=404, detail="campaign_not_found")
     return row
+
+
+async def _record_mutation(
+    session: AsyncSession,
+    *,
+    aggregate_id: UUID,
+    kind: str,
+    tenant_id: str,
+    idempotency_key: str,
+    payload: dict[str, Any],
+    principal: Principal,
+    correlation_id: str,
+    outcome: str = "completed",
+) -> bool:
+    fingerprint = _fingerprint(kind, tenant_id, payload)
+    result = await session.execute(
+        select(OperationModel).where(
+            OperationModel.tenant_id == tenant_id,
+            OperationModel.kind == kind,
+            OperationModel.idempotency_key == idempotency_key,
+        )
+    )
+    existing = result.scalar_one_or_none()
+    if existing is not None:
+        if existing.request_fingerprint != fingerprint:
+            raise HTTPException(status_code=409, detail="idempotency_conflict")
+        return False
+    operation = OperationModel(
+        tenant_id=tenant_id,
+        kind=kind,
+        aggregate_id=aggregate_id,
+        state=outcome,
+        idempotency_key=idempotency_key,
+        request_fingerprint=fingerprint,
+        requested_by=principal.subject,
+        correlation_id=correlation_id,
+        result_json="{}",
+    )
+    session.add(operation)
+    await session.flush()
+    session.add(
+        AuditEventModel(
+            tenant_id=tenant_id,
+            operation_id=operation.id,
+            aggregate_type="campaign",
+            aggregate_id=aggregate_id,
+            action=kind,
+            outcome=outcome,
+            actor_id=principal.subject,
+            correlation_id=correlation_id,
+            detail_json="{}",
+        )
+    )
+    return True
 
 
 @app.get("/health")
@@ -369,21 +437,87 @@ async def list_campaigns(
     return list(result.scalars().all())
 
 
+@router.patch("/campaigns/{campaign_id}", response_model=Campaign)
+async def update_campaign(
+    campaign_id: UUID,
+    body: CampaignUpdate,
+    request: Request,
+    x_tenant_id: TenantHeader,
+    idempotency_key: IdempotencyHeader,
+    session: AsyncSession = Depends(get_session),
+) -> CampaignModel:
+    principal = _principal(request)
+    principal.require("marketing.write")
+    result = await session.execute(
+        select(CampaignModel)
+        .where(CampaignModel.id == campaign_id, CampaignModel.tenant_id == x_tenant_id)
+        .with_for_update()
+    )
+    row = result.scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="campaign_not_found")
+    payload = body.model_dump(mode="json")
+    if not await _record_mutation(
+        session,
+        aggregate_id=campaign_id,
+        kind="campaign.update",
+        tenant_id=x_tenant_id,
+        idempotency_key=idempotency_key,
+        payload=payload,
+        principal=principal,
+        correlation_id=request.state.correlation_id,
+    ):
+        return row
+    if row.resource_version != body.expected_version:
+        raise HTTPException(status_code=409, detail="stale_resource_version")
+    changed_approval_input = False
+    for field in ("name", "objective", "daily_budget_minor", "currency"):
+        value = getattr(body, field)
+        if value is not None and value != getattr(row, field):
+            setattr(row, field, value)
+            changed_approval_input = changed_approval_input or field in {
+                "objective",
+                "daily_budget_minor",
+                "currency",
+            }
+    if changed_approval_input and row.state in {CampaignState.APPROVED.value, CampaignState.PAUSED.value}:
+        row.state = CampaignState.DRAFT.value
+    row.resource_version += 1
+    await session.commit()
+    await session.refresh(row)
+    return row
+
+
 @router.post("/campaigns/{campaign_id}/submit-for-approval", response_model=Campaign)
 async def submit_for_approval(
     campaign_id: UUID,
     body: ApprovalAction,
     request: Request,
     x_tenant_id: TenantHeader,
+    idempotency_key: IdempotencyHeader,
     session: AsyncSession = Depends(get_session),
 ) -> CampaignModel:
     principal = _principal(request)
     principal.require("marketing.write")
     _bind_actor(principal, body.actor_id)
-    row = await _campaign_for_tenant(session, campaign_id, x_tenant_id)
+    row = await _campaign_for_tenant(session, campaign_id, x_tenant_id, lock=True)
+    if not await _record_mutation(
+        session,
+        aggregate_id=campaign_id,
+        kind="campaign.submit_for_approval",
+        tenant_id=x_tenant_id,
+        idempotency_key=idempotency_key,
+        payload=body.model_dump(mode="json"),
+        principal=principal,
+        correlation_id=request.state.correlation_id,
+    ):
+        return row
+    if row.resource_version != body.expected_version:
+        raise HTTPException(status_code=409, detail="stale_resource_version")
     if row.state != CampaignState.DRAFT.value:
         raise HTTPException(status_code=409, detail="invalid_campaign_state")
     row.state = CampaignState.PENDING_APPROVAL.value
+    row.resource_version += 1
     session.add(
         ApprovalModel(
             tenant_id=x_tenant_id,
@@ -404,12 +538,26 @@ async def approve_campaign(
     body: ApprovalAction,
     request: Request,
     x_tenant_id: TenantHeader,
+    idempotency_key: IdempotencyHeader,
     session: AsyncSession = Depends(get_session),
 ) -> CampaignModel:
     principal = _principal(request)
     principal.require("marketing.approve")
     _bind_actor(principal, body.actor_id)
-    row = await _campaign_for_tenant(session, campaign_id, x_tenant_id)
+    row = await _campaign_for_tenant(session, campaign_id, x_tenant_id, lock=True)
+    if not await _record_mutation(
+        session,
+        aggregate_id=campaign_id,
+        kind="campaign.approve",
+        tenant_id=x_tenant_id,
+        idempotency_key=idempotency_key,
+        payload=body.model_dump(mode="json"),
+        principal=principal,
+        correlation_id=request.state.correlation_id,
+    ):
+        return row
+    if row.resource_version != body.expected_version:
+        raise HTTPException(status_code=409, detail="stale_resource_version")
     if row.state != CampaignState.PENDING_APPROVAL.value:
         raise HTTPException(status_code=409, detail="invalid_campaign_state")
     approval_result = await session.execute(
@@ -431,9 +579,117 @@ async def approve_campaign(
     approval.reason = body.reason
     approval.decided_at = datetime.now(timezone.utc)
     row.state = CampaignState.APPROVED.value
+    row.resource_version += 1
     await session.commit()
     await session.refresh(row)
     return row
+
+
+async def _transition_campaign(
+    campaign_id: UUID,
+    body: ApprovalAction,
+    request: Request,
+    tenant_id: str,
+    idempotency_key: str,
+    session: AsyncSession,
+    *,
+    action: str,
+    required_scope: str,
+    from_state: str,
+    to_state: str,
+) -> CampaignModel:
+    principal = _principal(request)
+    principal.require(required_scope)
+    _bind_actor(principal, body.actor_id)
+    row = await _campaign_for_tenant(session, campaign_id, tenant_id, lock=True)
+    if not await _record_mutation(
+        session,
+        aggregate_id=campaign_id,
+        kind=action,
+        tenant_id=tenant_id,
+        idempotency_key=idempotency_key,
+        payload=body.model_dump(mode="json"),
+        principal=principal,
+        correlation_id=request.state.correlation_id,
+    ):
+        return row
+    if row.resource_version != body.expected_version:
+        raise HTTPException(status_code=409, detail="stale_resource_version")
+    if row.state != from_state:
+        raise HTTPException(status_code=409, detail="invalid_campaign_state")
+    if action == "campaign.reject":
+        approval = (
+            await session.execute(
+                select(ApprovalModel)
+                .where(
+                    ApprovalModel.tenant_id == tenant_id,
+                    ApprovalModel.campaign_id == campaign_id,
+                    ApprovalModel.state == "pending",
+                )
+                .order_by(ApprovalModel.created_at.desc())
+            )
+        ).scalars().first()
+        if approval is None:
+            raise HTTPException(status_code=409, detail="pending_approval_missing")
+        if approval.requested_by == principal.subject:
+            raise HTTPException(status_code=409, detail="approval_separation_of_duties_required")
+        approval.state = "rejected"
+        approval.decided_by = principal.subject
+        approval.reason = body.reason
+        approval.decided_at = datetime.now(timezone.utc)
+    row.state = to_state
+    row.resource_version += 1
+    await session.commit()
+    await session.refresh(row)
+    return row
+
+
+@router.post("/campaigns/{campaign_id}/reject", response_model=Campaign)
+async def reject_campaign(
+    campaign_id: UUID,
+    body: ApprovalAction,
+    request: Request,
+    x_tenant_id: TenantHeader,
+    idempotency_key: IdempotencyHeader,
+    session: AsyncSession = Depends(get_session),
+) -> CampaignModel:
+    return await _transition_campaign(
+        campaign_id, body, request, x_tenant_id, idempotency_key, session,
+        action="campaign.reject", required_scope="marketing.approve",
+        from_state=CampaignState.PENDING_APPROVAL.value, to_state=CampaignState.DRAFT.value,
+    )
+
+
+@router.post("/campaigns/{campaign_id}/pause", response_model=Campaign)
+async def pause_campaign(
+    campaign_id: UUID,
+    body: ApprovalAction,
+    request: Request,
+    x_tenant_id: TenantHeader,
+    idempotency_key: IdempotencyHeader,
+    session: AsyncSession = Depends(get_session),
+) -> CampaignModel:
+    return await _transition_campaign(
+        campaign_id, body, request, x_tenant_id, idempotency_key, session,
+        action="campaign.pause", required_scope="marketing.write",
+        from_state=CampaignState.APPROVED.value, to_state=CampaignState.PAUSED.value,
+    )
+
+
+@router.post("/campaigns/{campaign_id}/resume", response_model=Campaign)
+async def resume_campaign(
+    campaign_id: UUID,
+    body: ApprovalAction,
+    request: Request,
+    x_tenant_id: TenantHeader,
+    idempotency_key: IdempotencyHeader,
+    session: AsyncSession = Depends(get_session),
+) -> CampaignModel:
+    return await _transition_campaign(
+        campaign_id, body, request, x_tenant_id, idempotency_key, session,
+        action="campaign.resume", required_scope="marketing.write",
+        from_state=CampaignState.PAUSED.value, to_state=CampaignState.APPROVED.value,
+    )
 
 
 @router.post(
