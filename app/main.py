@@ -11,6 +11,8 @@ from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse
+from fastapi.responses import Response
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -32,16 +34,32 @@ META_ALLOWED_AD_ACCOUNT_IDS = {
     if value.strip()
 }
 SERVICE = "codestra-marketing"
+REQUEST_COUNT = Counter(
+    "codestra_marketing_http_requests_total",
+    "Marketing API requests",
+    ("method", "route", "status"),
+)
+REQUEST_LATENCY = Histogram(
+    "codestra_marketing_http_request_duration_seconds",
+    "Marketing API request latency",
+    ("method", "route"),
+)
 
 
 @app.middleware("http")
 async def operational_headers(request: Request, call_next):
     correlation_id = request.headers.get("X-Correlation-ID") or str(uuid4())
     request.state.correlation_id = correlation_id
+    started = asyncio.get_running_loop().time()
     try:
         response = await call_next(request)
     except Exception:
         response = JSONResponse(status_code=500, content={"detail": "internal_error", "correlation_id": correlation_id})
+    route = request.scope.get("route")
+    route_path = getattr(route, "path", "unmatched")
+    elapsed = asyncio.get_running_loop().time() - started
+    REQUEST_LATENCY.labels(request.method, route_path).observe(elapsed)
+    REQUEST_COUNT.labels(request.method, route_path, str(response.status_code)).inc()
     response.headers["Cache-Control"] = "no-store"
     response.headers["X-Correlation-ID"] = correlation_id
     return response
@@ -160,6 +178,7 @@ async def _campaign_for_tenant(session: AsyncSession, campaign_id: UUID, tenant_
 
 
 @app.get("/health")
+@app.get("/health/live")
 def health(request: Request = None) -> dict[str, object]:
     correlation_id = getattr(getattr(request, "state", None), "correlation_id", str(uuid4()))
     return {
@@ -171,6 +190,8 @@ def health(request: Request = None) -> dict[str, object]:
 
 
 @app.get("/ready")
+@app.get("/readiness")
+@app.get("/health/ready")
 async def ready(request: Request, session: AsyncSession = Depends(get_session)):
     try:
         await asyncio.wait_for(session.execute(select(1)), timeout=2.0)
@@ -182,7 +203,25 @@ async def ready(request: Request, session: AsyncSession = Depends(get_session)):
 @app.get("/version")
 def version(request: Request = None) -> dict[str, object]:
     correlation_id = getattr(getattr(request, "state", None), "correlation_id", str(uuid4()))
-    return {"service": SERVICE, "application_version": app.version, "api_versions": ["v1"], "git_sha": os.getenv("CODESTRA_GIT_SHA", "unknown"), "image_digest": os.getenv("CODESTRA_IMAGE_DIGEST", "unknown"), "build_timestamp": os.getenv("CODESTRA_BUILD_TIMESTAMP", "unknown"), "migration_revision": os.getenv("CODESTRA_MIGRATION_REVISION", "unknown"), "environment": os.getenv("CODESTRA_ENVIRONMENT", "unknown"), "correlation_id": correlation_id}
+    return {
+        "service": SERVICE,
+        "application_version": app.version,
+        "api_versions": ["v1"],
+        "release_id": os.getenv("CODESTRA_RELEASE_ID", "unknown"),
+        "git_sha": os.getenv("CODESTRA_GIT_SHA", "unknown"),
+        "image_digest": os.getenv("CODESTRA_IMAGE_DIGEST", "unknown"),
+        "build_time": os.getenv("CODESTRA_BUILD_TIMESTAMP", "unknown"),
+        "schema_version": os.getenv("CODESTRA_MIGRATION_REVISION", "unknown"),
+        "configuration_checksum": os.getenv("CODESTRA_CONFIGURATION_CHECKSUM", "unknown"),
+        "environment": os.getenv("CODESTRA_ENVIRONMENT", "unknown"),
+        "correlation_id": correlation_id,
+    }
+
+
+@app.get("/metrics", include_in_schema=False)
+async def metrics(request: Request, principal: Principal = Depends(authenticate)) -> Response:
+    principal.require("marketing.metrics.read")
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.get("/capabilities")
