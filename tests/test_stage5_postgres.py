@@ -5,9 +5,13 @@ import uuid
 
 import pytest
 from fastapi import HTTPException
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from starlette.requests import Request
 
-from app.main import CampaignCreate, create_campaign, get_campaign
+from app.auth import Principal
+from app.main import CampaignCreate, activate_campaign, create_campaign, get_campaign
+from app.models import AuditEventModel, CampaignModel, OperationModel, OutboxModel
 
 pytestmark = pytest.mark.postgres
 
@@ -41,5 +45,62 @@ async def test_idempotency_and_cross_tenant_reads_fail_closed():
         with pytest.raises(HTTPException) as denied:
             await get_campaign(first_id, tenant_b, session)
         assert denied.value.status_code == 404
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_disabled_activation_is_durable_idempotent_and_has_no_outbox():
+    database_url = os.environ["DATABASE_URL"]
+    engine = create_async_engine(database_url)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    tenant_id = f"tenant-activation-{uuid.uuid4()}"
+    key = f"activate-{uuid.uuid4()}"
+
+    async with sessions() as session:
+        campaign = await create_campaign(
+            CampaignCreate(name="Denied activation", objective="leads", daily_budget_minor=0),
+            tenant_id,
+            f"create-{uuid.uuid4()}",
+            session,
+        )
+        campaign.state = "approved"
+        await session.commit()
+        campaign_id = campaign.id
+
+    request = Request({"type": "http", "method": "POST", "path": "/", "headers": []})
+    request.state.correlation_id = f"corr-{uuid.uuid4()}"
+    request.state.principal = Principal(
+        subject="marketing-operator",
+        tenant_id=tenant_id,
+        scopes=frozenset({"marketing.provider.write"}),
+        client_id="codestra-console",
+    )
+    async with sessions() as session:
+        first = await activate_campaign(campaign_id, request, tenant_id, key, session)
+        assert first.status_code == 423
+    async with sessions() as session:
+        duplicate = await activate_campaign(campaign_id, request, tenant_id, key, session)
+        assert duplicate.status_code == 423
+    async with sessions() as session:
+        operation = (
+            await session.execute(
+                select(OperationModel).where(
+                    OperationModel.tenant_id == tenant_id,
+                    OperationModel.idempotency_key == key,
+                )
+            )
+        ).scalar_one()
+        assert operation.state == "denied"
+        assert operation.error_code == "live_advertising_disabled"
+        assert await session.scalar(
+            select(func.count()).select_from(OutboxModel).where(OutboxModel.operation_id == operation.id)
+        ) == 0
+        assert await session.scalar(
+            select(func.count()).select_from(AuditEventModel).where(AuditEventModel.operation_id == operation.id)
+        ) == 1
+        assert await session.scalar(
+            select(func.count()).select_from(CampaignModel).where(CampaignModel.id == campaign_id)
+        ) == 1
 
     await engine.dispose()

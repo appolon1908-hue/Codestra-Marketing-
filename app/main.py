@@ -20,7 +20,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .db import get_session
 from .auth import Principal, authenticate
-from .models import ApprovalModel, AudienceModel, CampaignModel, CreativeModel
+from .models import (
+    ApprovalModel,
+    AudienceModel,
+    AuditEventModel,
+    CampaignModel,
+    CreativeModel,
+    OperationModel,
+    OutboxModel,
+)
 from .providers.meta_read import MetaReadClient
 
 app = FastAPI(title="Codestra Marketing API", version="0.3.0")
@@ -124,6 +132,32 @@ class Creative(BaseModel):
     name: str
     content: dict[str, Any]
     approval_state: str
+
+
+class Operation(BaseModel):
+    id: UUID
+    tenant_id: str
+    kind: str
+    aggregate_id: UUID
+    state: str
+    correlation_id: str
+    attempts: int
+    error_code: str | None
+    status_url: str
+
+
+def _operation_response(row: OperationModel) -> Operation:
+    return Operation(
+        id=row.id,
+        tenant_id=row.tenant_id,
+        kind=row.kind,
+        aggregate_id=row.aggregate_id,
+        state=row.state,
+        correlation_id=row.correlation_id,
+        attempts=row.attempts,
+        error_code=row.error_code,
+        status_url=f"/v1/marketing/operations/{row.id}",
+    )
 
 
 def _tenant(header_tenant: str, body_tenant: str | None = None) -> str:
@@ -392,20 +426,123 @@ async def approve_campaign(
     return row
 
 
-@router.post("/campaigns/{campaign_id}/activate")
+@router.post(
+    "/campaigns/{campaign_id}/activate",
+    response_model=Operation,
+    status_code=status.HTTP_202_ACCEPTED,
+    responses={423: {"model": Operation}},
+)
 async def activate_campaign(
     campaign_id: UUID,
     request: Request,
     x_tenant_id: TenantHeader,
+    idempotency_key: IdempotencyHeader,
     session: AsyncSession = Depends(get_session),
-) -> dict[str, str]:
-    _principal(request).require("marketing.provider.write")
+) -> Operation | JSONResponse:
+    principal = _principal(request)
+    principal.require("marketing.provider.write")
     row = await _campaign_for_tenant(session, campaign_id, x_tenant_id)
     if row.state != CampaignState.APPROVED.value:
         raise HTTPException(status_code=409, detail="campaign_not_approved")
-    if not LIVE_ADVERTISING_ENABLED:
-        raise HTTPException(status_code=423, detail="live_advertising_disabled")
-    raise HTTPException(status_code=501, detail="provider_activation_not_implemented")
+    fingerprint = _fingerprint("campaign.activate", x_tenant_id, {"campaign_id": str(campaign_id)})
+    existing_result = await session.execute(
+        select(OperationModel).where(
+            OperationModel.tenant_id == x_tenant_id,
+            OperationModel.kind == "campaign.activate",
+            OperationModel.idempotency_key == idempotency_key,
+        )
+    )
+    operation = existing_result.scalar_one_or_none()
+    if operation is not None:
+        if operation.request_fingerprint != fingerprint:
+            raise HTTPException(status_code=409, detail="idempotency_conflict")
+    else:
+        denied = not LIVE_ADVERTISING_ENABLED
+        operation = OperationModel(
+            tenant_id=x_tenant_id,
+            kind="campaign.activate",
+            aggregate_id=campaign_id,
+            state="denied" if denied else "pending",
+            idempotency_key=idempotency_key,
+            request_fingerprint=fingerprint,
+            requested_by=principal.subject,
+            correlation_id=request.state.correlation_id,
+            error_code="live_advertising_disabled" if denied else None,
+        )
+        session.add(operation)
+        await session.flush()
+        if not denied:
+            session.add(
+                OutboxModel(
+                    tenant_id=x_tenant_id,
+                    operation_id=operation.id,
+                    destination="middleware",
+                    event_type="marketing.campaign.activation.requested",
+                    payload_json=json.dumps(
+                        {
+                            "operation_id": str(operation.id),
+                            "campaign_id": str(campaign_id),
+                            "tenant_id": x_tenant_id,
+                            "correlation_id": request.state.correlation_id,
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                )
+            )
+        session.add(
+            AuditEventModel(
+                tenant_id=x_tenant_id,
+                operation_id=operation.id,
+                aggregate_type="campaign",
+                aggregate_id=campaign_id,
+                action="campaign.activate",
+                outcome="denied" if denied else "accepted",
+                actor_id=principal.subject,
+                correlation_id=request.state.correlation_id,
+                detail_json=json.dumps({"external_effect_executed": False}, separators=(",", ":")),
+            )
+        )
+        try:
+            await session.commit()
+        except IntegrityError:
+            await session.rollback()
+            retry_result = await session.execute(
+                select(OperationModel).where(
+                    OperationModel.tenant_id == x_tenant_id,
+                    OperationModel.kind == "campaign.activate",
+                    OperationModel.idempotency_key == idempotency_key,
+                )
+            )
+            operation = retry_result.scalar_one_or_none()
+            if operation is None or operation.request_fingerprint != fingerprint:
+                raise HTTPException(status_code=409, detail="idempotency_conflict")
+        await session.refresh(operation)
+
+    body = _operation_response(operation)
+    if operation.state == "denied":
+        return JSONResponse(status_code=423, content=body.model_dump(mode="json"))
+    return body
+
+
+@router.get("/operations/{operation_id}", response_model=Operation)
+async def get_operation(
+    operation_id: UUID,
+    request: Request,
+    x_tenant_id: TenantHeader,
+    session: AsyncSession = Depends(get_session),
+) -> Operation:
+    _principal(request).require("marketing.read")
+    result = await session.execute(
+        select(OperationModel).where(
+            OperationModel.id == operation_id,
+            OperationModel.tenant_id == x_tenant_id,
+        )
+    )
+    row = result.scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="operation_not_found")
+    return _operation_response(row)
 
 
 @router.post("/audiences", response_model=Audience, status_code=status.HTTP_201_CREATED)

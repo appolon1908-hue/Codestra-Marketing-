@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import BigInteger, DateTime, ForeignKey, String, Text, UniqueConstraint, func
+from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -72,3 +72,60 @@ class CreativeModel(Base):
     request_fingerprint: Mapped[str] = mapped_column(String(64))
 
     __table_args__ = (UniqueConstraint("tenant_id", "idempotency_key", name="uq_creative_idempotency"),)
+
+
+class OperationModel(Base):
+    __tablename__ = "marketing_operations"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[str] = mapped_column(String(64), index=True)
+    kind: Mapped[str] = mapped_column(String(80), index=True)
+    aggregate_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), index=True)
+    state: Mapped[str] = mapped_column(String(32), index=True)
+    idempotency_key: Mapped[str] = mapped_column(String(200))
+    request_fingerprint: Mapped[str] = mapped_column(String(64))
+    requested_by: Mapped[str] = mapped_column(String(128))
+    correlation_id: Mapped[str] = mapped_column(String(128), index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    result_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "kind", "idempotency_key", name="uq_marketing_operation_idempotency"),
+    )
+
+
+class OutboxModel(Base):
+    __tablename__ = "marketing_outbox"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[str] = mapped_column(String(64), index=True)
+    operation_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("marketing_operations.id", ondelete="CASCADE"), unique=True, index=True
+    )
+    destination: Mapped[str] = mapped_column(String(80))
+    event_type: Mapped[str] = mapped_column(String(120))
+    payload_json: Mapped[str] = mapped_column(Text)
+    state: Mapped[str] = mapped_column(String(32), default="pending", index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    next_attempt_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class AuditEventModel(Base):
+    __tablename__ = "marketing_audit_events"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[str] = mapped_column(String(64), index=True)
+    operation_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True, index=True)
+    aggregate_type: Mapped[str] = mapped_column(String(80))
+    aggregate_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), index=True)
+    action: Mapped[str] = mapped_column(String(120), index=True)
+    outcome: Mapped[str] = mapped_column(String(32))
+    actor_id: Mapped[str] = mapped_column(String(128))
+    correlation_id: Mapped[str] = mapped_column(String(128), index=True)
+    detail_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
