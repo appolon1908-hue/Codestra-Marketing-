@@ -5,7 +5,7 @@ import json
 import os
 import asyncio
 from datetime import datetime, timezone
-from enum import StrEnum
+from enum import Enum
 from typing import Annotated, Any
 from uuid import UUID, uuid4
 
@@ -17,11 +17,12 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .db import get_session
+from .auth import Principal, authenticate
 from .models import ApprovalModel, AudienceModel, CampaignModel, CreativeModel
 from .providers.meta_read import MetaReadClient
 
 app = FastAPI(title="Codestra Marketing API", version="0.3.0")
-router = APIRouter(prefix="/v1/marketing")
+router = APIRouter(prefix="/v1/marketing", dependencies=[Depends(authenticate)])
 
 LIVE_ADVERTISING_ENABLED = os.getenv("LIVE_ADVERTISING_ENABLED", "false").lower() == "true"
 META_READ_SYNC_ENABLED = os.getenv("META_READ_SYNC_ENABLED", "false").lower() == "true"
@@ -47,10 +48,9 @@ async def operational_headers(request: Request, call_next):
 
 TenantHeader = Annotated[str, Header(alias="X-Tenant-ID", min_length=1, max_length=64)]
 IdempotencyHeader = Annotated[str, Header(alias="Idempotency-Key", min_length=8, max_length=200)]
-VerifiedScopesHeader = Annotated[str, Header(alias="X-Codestra-Verified-Scopes")]
 
 
-class CampaignState(StrEnum):
+class CampaignState(str, Enum):
     DRAFT = "draft"
     PENDING_APPROVAL = "pending_approval"
     APPROVED = "approved"
@@ -114,9 +114,26 @@ def _tenant(header_tenant: str, body_tenant: str | None = None) -> str:
     return header_tenant
 
 
-def _require_scope(verified_scopes: str, required: str) -> None:
-    if required not in set(verified_scopes.split()):
-        raise HTTPException(status_code=403, detail="required_scope_missing")
+def _principal(request: Request) -> Principal:
+    value = getattr(request.state, "principal", None)
+    if not isinstance(value, Principal):
+        raise HTTPException(status_code=401, detail="authenticated_principal_required")
+    return value
+
+
+def _request_scope(request: Request | None, scope: str) -> Principal | None:
+    # Direct service-function tests may omit Request; every HTTP route receives it
+    # from FastAPI and is additionally guarded by the router authentication dependency.
+    if request is None:
+        return None
+    principal = _principal(request)
+    principal.require(scope)
+    return principal
+
+
+def _bind_actor(principal: Principal, claimed_actor: str) -> None:
+    if claimed_actor != principal.subject:
+        raise HTTPException(status_code=403, detail="actor_identity_mismatch")
 
 
 def _fingerprint(kind: str, tenant_id: str, payload: dict[str, Any]) -> str:
@@ -199,7 +216,9 @@ async def create_campaign(
     x_tenant_id: TenantHeader,
     idempotency_key: IdempotencyHeader,
     session: AsyncSession = Depends(get_session),
+    request: Request = None,
 ) -> CampaignModel:
+    _request_scope(request, "marketing.write")
     tenant_id = _tenant(x_tenant_id, body.tenant_id)
     data = body.model_dump(mode="json", exclude={"tenant_id"})
     fingerprint = _fingerprint("campaign.create", tenant_id, data)
@@ -246,7 +265,9 @@ async def get_campaign(
     campaign_id: UUID,
     x_tenant_id: TenantHeader,
     session: AsyncSession = Depends(get_session),
+    request: Request = None,
 ) -> CampaignModel:
+    _request_scope(request, "marketing.read")
     return await _campaign_for_tenant(session, campaign_id, x_tenant_id)
 
 
@@ -254,7 +275,9 @@ async def get_campaign(
 async def list_campaigns(
     x_tenant_id: TenantHeader,
     session: AsyncSession = Depends(get_session),
+    request: Request = None,
 ) -> list[CampaignModel]:
+    _request_scope(request, "marketing.read")
     result = await session.execute(
         select(CampaignModel)
         .where(CampaignModel.tenant_id == x_tenant_id)
@@ -267,11 +290,13 @@ async def list_campaigns(
 async def submit_for_approval(
     campaign_id: UUID,
     body: ApprovalAction,
+    request: Request,
     x_tenant_id: TenantHeader,
-    x_codestra_verified_scopes: VerifiedScopesHeader,
     session: AsyncSession = Depends(get_session),
 ) -> CampaignModel:
-    _require_scope(x_codestra_verified_scopes, "marketing.write")
+    principal = _principal(request)
+    principal.require("marketing.write")
+    _bind_actor(principal, body.actor_id)
     row = await _campaign_for_tenant(session, campaign_id, x_tenant_id)
     if row.state != CampaignState.DRAFT.value:
         raise HTTPException(status_code=409, detail="invalid_campaign_state")
@@ -280,7 +305,7 @@ async def submit_for_approval(
         ApprovalModel(
             tenant_id=x_tenant_id,
             campaign_id=row.id,
-            requested_by=body.actor_id,
+            requested_by=principal.subject,
             state="pending",
             reason=body.reason,
         )
@@ -294,11 +319,13 @@ async def submit_for_approval(
 async def approve_campaign(
     campaign_id: UUID,
     body: ApprovalAction,
+    request: Request,
     x_tenant_id: TenantHeader,
-    x_codestra_verified_scopes: VerifiedScopesHeader,
     session: AsyncSession = Depends(get_session),
 ) -> CampaignModel:
-    _require_scope(x_codestra_verified_scopes, "marketing.approve")
+    principal = _principal(request)
+    principal.require("marketing.approve")
+    _bind_actor(principal, body.actor_id)
     row = await _campaign_for_tenant(session, campaign_id, x_tenant_id)
     if row.state != CampaignState.PENDING_APPROVAL.value:
         raise HTTPException(status_code=409, detail="invalid_campaign_state")
@@ -314,8 +341,10 @@ async def approve_campaign(
     approval = approval_result.scalars().first()
     if approval is None:
         raise HTTPException(status_code=409, detail="pending_approval_missing")
+    if approval.requested_by == principal.subject:
+        raise HTTPException(status_code=409, detail="approval_separation_of_duties_required")
     approval.state = "approved"
-    approval.decided_by = body.actor_id
+    approval.decided_by = principal.subject
     approval.reason = body.reason
     approval.decided_at = datetime.now(timezone.utc)
     row.state = CampaignState.APPROVED.value
@@ -327,11 +356,11 @@ async def approve_campaign(
 @router.post("/campaigns/{campaign_id}/activate")
 async def activate_campaign(
     campaign_id: UUID,
+    request: Request,
     x_tenant_id: TenantHeader,
-    x_codestra_verified_scopes: VerifiedScopesHeader,
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, str]:
-    _require_scope(x_codestra_verified_scopes, "marketing.provider.write")
+    _principal(request).require("marketing.provider.write")
     row = await _campaign_for_tenant(session, campaign_id, x_tenant_id)
     if row.state != CampaignState.APPROVED.value:
         raise HTTPException(status_code=409, detail="campaign_not_approved")
@@ -346,7 +375,9 @@ async def create_audience(
     x_tenant_id: TenantHeader,
     idempotency_key: IdempotencyHeader,
     session: AsyncSession = Depends(get_session),
+    request: Request = None,
 ) -> Audience:
+    _request_scope(request, "marketing.write")
     tenant_id = _tenant(x_tenant_id, body.tenant_id)
     definition_json = json.dumps(body.definition, sort_keys=True, separators=(",", ":"))
     fingerprint = _fingerprint("audience.create", tenant_id, {"name": body.name, "definition": body.definition})
@@ -380,7 +411,9 @@ async def create_creative(
     x_tenant_id: TenantHeader,
     idempotency_key: IdempotencyHeader,
     session: AsyncSession = Depends(get_session),
+    request: Request = None,
 ) -> Creative:
+    _request_scope(request, "marketing.write")
     tenant_id = _tenant(x_tenant_id, body.tenant_id)
     content_json = json.dumps(body.content, sort_keys=True, separators=(",", ":"))
     fingerprint = _fingerprint("creative.create", tenant_id, {"name": body.name, "content": body.content})
@@ -418,8 +451,10 @@ async def create_creative(
 @router.get("/providers/meta/accounts/{ad_account_id}/campaigns")
 async def meta_campaign_snapshots(
     ad_account_id: str,
+    request: Request,
     x_tenant_id: TenantHeader,
 ) -> list[dict[str, object]]:
+    _principal(request).require("marketing.provider.read")
     del x_tenant_id  # tenant is mandatory even though provider credentials remain centrally scoped.
     if not META_READ_SYNC_ENABLED:
         raise HTTPException(status_code=423, detail="meta_read_sync_disabled")
