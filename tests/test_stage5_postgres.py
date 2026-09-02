@@ -63,6 +63,7 @@ async def _seed_outbox(sessions, suffix: str) -> uuid.UUID:
     payload = {
         "operation_id": str(operation_id),
         "campaign_id": str(campaign_id),
+        "expected_version": 1,
         "tenant_id": tenant_id,
         "correlation_id": correlation_id,
     }

@@ -786,6 +786,7 @@ async def activate_campaign(
                         {
                             "operation_id": str(operation.id),
                             "campaign_id": str(campaign_id),
+                            "expected_version": row.resource_version,
                             "tenant_id": x_tenant_id,
                             "correlation_id": request.state.correlation_id,
                         },
