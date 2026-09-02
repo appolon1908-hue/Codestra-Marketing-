@@ -450,6 +450,31 @@ async def test_disabled_activation_is_durable_idempotent_and_has_no_outbox():
 
 
 @pytest.mark.asyncio
+async def test_live_campaign_allows_only_one_activation_operation(monkeypatch):
+    monkeypatch.setattr("app.main.LIVE_ADVERTISING_ENABLED", True)
+    engine = create_async_engine(os.environ["DATABASE_URL"])
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    tenant_id = f"tenant-single-activation-{uuid.uuid4()}"
+    request = _request(tenant_id, "marketing-operator", {"marketing.provider.write"})
+    async with sessions() as session:
+        campaign = await create_campaign(
+            CampaignCreate(name="Single activation", objective="leads", daily_budget_minor=100),
+            tenant_id, f"create-{uuid.uuid4()}", session,
+        )
+        campaign.state = "approved"
+        await session.commit()
+        campaign_id = campaign.id
+    async with sessions() as session:
+        first = await activate_campaign(campaign_id, request, tenant_id, f"activate-{uuid.uuid4()}", session)
+        assert first.state == "pending"
+    async with sessions() as session:
+        with pytest.raises(HTTPException, match="campaign_activation_already_exists") as duplicate:
+            await activate_campaign(campaign_id, request, tenant_id, f"activate-{uuid.uuid4()}", session)
+        assert duplicate.value.status_code == 409
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_attribution_is_tenant_scoped_idempotent_and_reporting_is_bounded():
     engine = create_async_engine(os.environ["DATABASE_URL"])
     sessions = async_sessionmaker(engine, expire_on_commit=False)
@@ -478,4 +503,15 @@ async def test_attribution_is_tenant_scoped_idempotent_and_reporting_is_bounded(
         assert report["items"][0]["touch_count"] == 1
         with pytest.raises(HTTPException, match="reporting_window_too_large"):
             await performance(reader, tenant_id, now - timedelta(days=94), now, session)
+    other_tenant = f"tenant-attribution-other-{uuid.uuid4()}"
+    async with sessions() as session:
+        campaign = await create_campaign(
+            CampaignCreate(name="Other tenant campaign", objective="leads", daily_budget_minor=0),
+            other_tenant, f"create-{uuid.uuid4()}", session,
+        )
+    invalid = body.model_copy(update={"event_id": f"event-{uuid.uuid4()}", "campaign_id": campaign.id})
+    async with sessions() as session:
+        with pytest.raises(HTTPException, match="campaign_not_found") as hidden:
+            await create_attribution_touch(invalid, request, tenant_id, f"attribution-{uuid.uuid4()}", session)
+        assert hidden.value.status_code == 404
     await engine.dispose()

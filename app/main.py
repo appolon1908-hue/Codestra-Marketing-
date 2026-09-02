@@ -69,7 +69,6 @@ REQUEST_LATENCY = Histogram(
 ATTRIBUTION_TOUCHES = Counter(
     "codestra_marketing_attribution_touches_total",
     "Durably accepted attribution touches",
-    ("channel",),
 )
 
 
@@ -854,7 +853,10 @@ async def activate_campaign(
 ) -> Operation | JSONResponse:
     principal = _principal(request)
     principal.require("marketing.provider.write")
-    row = await _campaign_for_tenant(session, campaign_id, x_tenant_id)
+    # Serialize all activation attempts for this aggregate. This makes the
+    # aggregate-level duplicate check below effective even when callers use
+    # different idempotency keys concurrently.
+    row = await _campaign_for_tenant(session, campaign_id, x_tenant_id, lock=True)
     fingerprint = _fingerprint("campaign.activate", x_tenant_id, {"campaign_id": str(campaign_id)})
     existing_result = await session.execute(
         select(OperationModel).where(
@@ -868,6 +870,16 @@ async def activate_campaign(
         if operation.request_fingerprint != fingerprint:
             raise HTTPException(status_code=409, detail="idempotency_conflict")
     else:
+        active_operation = await session.scalar(
+            select(OperationModel).where(
+                OperationModel.tenant_id == x_tenant_id,
+                OperationModel.aggregate_id == campaign_id,
+                OperationModel.kind == "campaign.activate",
+                OperationModel.state.in_({"pending", "processing", "accepted", "reconciliation_required"}),
+            )
+        )
+        if active_operation is not None:
+            raise HTTPException(status_code=409, detail="campaign_activation_already_exists")
         if row.state != CampaignState.APPROVED.value:
             raise HTTPException(status_code=409, detail="campaign_not_approved")
         denied = not LIVE_ADVERTISING_ENABLED
@@ -1264,6 +1276,16 @@ async def create_attribution_touch(
     principal.require("marketing.attribution.write")
     if body.occurred_at.tzinfo is None:
         raise HTTPException(status_code=422, detail="occurred_at_timezone_required")
+    if body.campaign_id is not None:
+        campaign = await session.scalar(
+            select(CampaignModel.id).where(
+                CampaignModel.id == body.campaign_id,
+                CampaignModel.tenant_id == x_tenant_id,
+            )
+        )
+        if campaign is None:
+            # Tenant-scoped not-found avoids leaking another tenant's campaign.
+            raise HTTPException(status_code=404, detail="campaign_not_found")
     metadata_json = json.dumps(body.metadata, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     if len(metadata_json.encode()) > 16_384:
         raise HTTPException(status_code=413, detail="attribution_metadata_too_large")
@@ -1319,7 +1341,7 @@ async def create_attribution_touch(
             raise HTTPException(status_code=409, detail="attribution_event_conflict") from exc
         return prior
     await session.refresh(row)
-    ATTRIBUTION_TOUCHES.labels(channel=body.channel).inc()
+    ATTRIBUTION_TOUCHES.inc()
     return row
 
 

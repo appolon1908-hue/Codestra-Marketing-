@@ -166,25 +166,28 @@ async def run_once(
             select(CampaignModel).where(
                 CampaignModel.id == campaign_id,
                 CampaignModel.tenant_id == str(item.payload.get("tenant_id", "")),
-            )
+            ).with_for_update()
         )
-    if (
-        campaign is None
-        or campaign.state != expected_state
-        or campaign.resource_version != expected_version
-    ):
-        await fail(
-            item,
-            MiddlewareDeliveryError("campaign_approval_stale", retryable=False),
-            max_attempts,
-            session_factory=session_factory,
-        )
-        return True
-    try:
-        result = await client.deliver(item.payload)
-    except MiddlewareDeliveryError as exc:
-        await fail(item, exc, max_attempts, session_factory=session_factory)
+        if (
+            campaign is None
+            or campaign.state != expected_state
+            or campaign.resource_version != expected_version
+        ):
+            delivery_error = MiddlewareDeliveryError("campaign_approval_stale", retryable=False)
+            result = None
+        else:
+            delivery_error = None
+            try:
+                # Keep the aggregate row locked through Middleware acceptance.
+                # Material edits and lifecycle changes use the same lock, so an
+                # approval cannot be invalidated between validation and delivery.
+                result = await client.deliver(item.payload)
+            except MiddlewareDeliveryError as exc:
+                delivery_error = exc
+    if delivery_error is not None:
+        await fail(item, delivery_error, max_attempts, session_factory=session_factory)
     else:
+        assert result is not None
         await complete(item, result, session_factory=session_factory)
     return True
 
