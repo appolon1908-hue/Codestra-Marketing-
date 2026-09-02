@@ -5,17 +5,17 @@ import json
 import os
 import asyncio
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Annotated, Any
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request, status
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
 from fastapi.responses import Response
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -23,6 +23,7 @@ from .db import get_session
 from .auth import Principal, authenticate
 from .models import (
     ApprovalModel,
+    AttributionTouchModel,
     AudienceModel,
     AuditEventModel,
     CampaignModel,
@@ -53,6 +54,11 @@ REQUEST_LATENCY = Histogram(
     "codestra_marketing_http_request_duration_seconds",
     "Marketing API request latency",
     ("method", "route"),
+)
+ATTRIBUTION_TOUCHES = Counter(
+    "codestra_marketing_attribution_touches_total",
+    "Durably accepted attribution touches",
+    ("channel",),
 )
 
 
@@ -183,6 +189,26 @@ class Operation(BaseModel):
     status_url: str
 
 
+class AttributionTouchCreate(BaseModel):
+    model_config = {"extra": "forbid"}
+    event_id: str = Field(min_length=1, max_length=128)
+    lead_id: str = Field(min_length=1, max_length=128)
+    campaign_id: UUID | None = None
+    channel: str = Field(min_length=1, max_length=64, pattern=r"^[a-z0-9][a-z0-9_.-]*$")
+    occurred_at: datetime
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class AttributionTouch(BaseModel):
+    id: UUID
+    event_id: str
+    lead_id: str
+    campaign_id: UUID | None
+    channel: str
+    occurred_at: datetime
+    model_config = {"from_attributes": True}
+
+
 def _operation_response(row: OperationModel) -> Operation:
     return Operation(
         id=row.id,
@@ -285,7 +311,11 @@ async def _record_mutation(
     outcome: str = "completed",
     aggregate_type: str = "campaign",
 ) -> bool:
-    fingerprint = _fingerprint(kind, tenant_id, payload)
+    fingerprint = _fingerprint(
+        kind,
+        tenant_id,
+        {"aggregate_id": str(aggregate_id), "payload": payload},
+    )
     result = await session.execute(
         select(OperationModel).where(
             OperationModel.tenant_id == tenant_id,
@@ -343,6 +373,17 @@ def health(request: Request = None) -> dict[str, object]:
 @app.get("/readiness")
 @app.get("/health/ready")
 async def ready(request: Request, session: AsyncSession = Depends(get_session)):
+    required_identity = ("KEYCLOAK_ISSUER", "KEYCLOAK_AUDIENCE", "KEYCLOAK_ALLOWED_CLIENT_IDS")
+    if any(not os.getenv(name, "").strip() for name in required_identity):
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "not_ready",
+                "service": SERVICE,
+                "dependencies": {"database": "unknown", "identity": "unconfigured"},
+                "correlation_id": request.state.correlation_id,
+            },
+        )
     try:
         await asyncio.wait_for(session.execute(select(1)), timeout=2.0)
     except Exception:
@@ -392,7 +433,7 @@ def capabilities(request: Request = None) -> dict[str, object]:
         "audiences": True,
         "creatives": True,
         "approvals": True,
-        "attribution": False,
+        "attribution": True,
         "meta_read_sync": META_READ_SYNC_ENABLED,
         "provider_writes": LIVE_ADVERTISING_ENABLED,
         "correlation_id": correlation_id,
@@ -518,7 +559,23 @@ async def update_campaign(
                 "daily_budget_minor",
                 "currency",
             }
-    if changed_approval_input and row.state in {CampaignState.APPROVED.value, CampaignState.PAUSED.value}:
+    if changed_approval_input and row.state in {
+        CampaignState.PENDING_APPROVAL.value,
+        CampaignState.APPROVED.value,
+        CampaignState.PAUSED.value,
+    }:
+        pending_approvals = await session.scalars(
+            select(ApprovalModel).where(
+                ApprovalModel.tenant_id == x_tenant_id,
+                ApprovalModel.campaign_id == campaign_id,
+                ApprovalModel.state == "pending",
+            ).with_for_update()
+        )
+        for approval in pending_approvals:
+            approval.state = "invalidated"
+            approval.decided_by = principal.subject
+            approval.decided_at = datetime.now(timezone.utc)
+            approval.reason = "campaign_materially_changed"
         row.state = CampaignState.DRAFT.value
     row.resource_version += 1
     await session.commit()
@@ -677,6 +734,47 @@ async def _transition_campaign(
         approval.decided_at = datetime.now(timezone.utc)
     row.state = to_state
     row.resource_version += 1
+    if action in {"campaign.pause", "campaign.resume"} and LIVE_ADVERTISING_ENABLED:
+        prior_activation = await session.scalar(
+            select(OperationModel).where(
+                OperationModel.tenant_id == tenant_id,
+                OperationModel.aggregate_id == campaign_id,
+                OperationModel.kind == "campaign.activate",
+                OperationModel.state == "accepted",
+            )
+        )
+        if prior_activation is not None:
+            operation = await session.scalar(
+                select(OperationModel).where(
+                    OperationModel.tenant_id == tenant_id,
+                    OperationModel.kind == action,
+                    OperationModel.idempotency_key == idempotency_key,
+                )
+            )
+            if operation is None:
+                raise RuntimeError("durable transition operation missing")
+            operation.state = "pending"
+            session.add(
+                OutboxModel(
+                    tenant_id=tenant_id,
+                    operation_id=operation.id,
+                    destination="middleware",
+                    event_type=f"marketing.{action}.requested",
+                    payload_json=json.dumps(
+                        {
+                            "operation_id": str(operation.id),
+                            "campaign_id": str(campaign_id),
+                            "action": action.removeprefix("campaign."),
+                            "expected_state": to_state,
+                            "expected_version": row.resource_version,
+                            "tenant_id": tenant_id,
+                            "correlation_id": request.state.correlation_id,
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                )
+            )
     await session.commit()
     await session.refresh(row)
     return row
@@ -746,8 +844,6 @@ async def activate_campaign(
     principal = _principal(request)
     principal.require("marketing.provider.write")
     row = await _campaign_for_tenant(session, campaign_id, x_tenant_id)
-    if row.state != CampaignState.APPROVED.value:
-        raise HTTPException(status_code=409, detail="campaign_not_approved")
     fingerprint = _fingerprint("campaign.activate", x_tenant_id, {"campaign_id": str(campaign_id)})
     existing_result = await session.execute(
         select(OperationModel).where(
@@ -761,6 +857,8 @@ async def activate_campaign(
         if operation.request_fingerprint != fingerprint:
             raise HTTPException(status_code=409, detail="idempotency_conflict")
     else:
+        if row.state != CampaignState.APPROVED.value:
+            raise HTTPException(status_code=409, detail="campaign_not_approved")
         denied = not LIVE_ADVERTISING_ENABLED
         operation = OperationModel(
             tenant_id=x_tenant_id,
@@ -786,6 +884,8 @@ async def activate_campaign(
                         {
                             "operation_id": str(operation.id),
                             "campaign_id": str(campaign_id),
+                            "action": "activate",
+                            "expected_state": CampaignState.APPROVED.value,
                             "expected_version": row.resource_version,
                             "tenant_id": x_tenant_id,
                             "correlation_id": request.state.correlation_id,
@@ -1139,6 +1239,142 @@ async def reject_creative(
         action="creative.reject", required_scope="marketing.approve",
         from_state="pending_approval", to_state="draft",
     )
+
+
+@router.post("/attribution/touches", response_model=AttributionTouch, status_code=201)
+async def create_attribution_touch(
+    body: AttributionTouchCreate,
+    request: Request,
+    x_tenant_id: TenantHeader,
+    idempotency_key: IdempotencyHeader,
+    session: AsyncSession = Depends(get_session),
+) -> AttributionTouchModel:
+    principal = _principal(request)
+    principal.require("marketing.attribution.write")
+    if body.occurred_at.tzinfo is None:
+        raise HTTPException(status_code=422, detail="occurred_at_timezone_required")
+    metadata_json = json.dumps(body.metadata, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    if len(metadata_json.encode()) > 16_384:
+        raise HTTPException(status_code=413, detail="attribution_metadata_too_large")
+    payload = body.model_dump(mode="json")
+    fingerprint = _fingerprint("attribution.touch", x_tenant_id, payload)
+    existing = await session.scalar(
+        select(AttributionTouchModel).where(
+            AttributionTouchModel.tenant_id == x_tenant_id,
+            AttributionTouchModel.idempotency_key == idempotency_key,
+        )
+    )
+    if existing is not None:
+        if existing.request_fingerprint != fingerprint:
+            raise HTTPException(status_code=409, detail="idempotency_conflict")
+        return existing
+    row = AttributionTouchModel(
+        tenant_id=x_tenant_id,
+        event_id=body.event_id,
+        lead_id=body.lead_id,
+        campaign_id=body.campaign_id,
+        channel=body.channel,
+        occurred_at=body.occurred_at,
+        metadata_hash=hashlib.sha256(metadata_json.encode()).hexdigest(),
+        idempotency_key=idempotency_key,
+        request_fingerprint=fingerprint,
+    )
+    session.add(row)
+    await session.flush()
+    session.add(
+        AuditEventModel(
+            tenant_id=x_tenant_id,
+            operation_id=None,
+            aggregate_type="attribution_touch",
+            aggregate_id=row.id,
+            action="attribution.touch.accepted",
+            outcome="completed",
+            actor_id=principal.subject,
+            correlation_id=request.state.correlation_id,
+            detail_json=json.dumps({"channel": body.channel}, separators=(",", ":")),
+        )
+    )
+    try:
+        await session.commit()
+    except IntegrityError as exc:
+        await session.rollback()
+        prior = await session.scalar(
+            select(AttributionTouchModel).where(
+                AttributionTouchModel.tenant_id == x_tenant_id,
+                AttributionTouchModel.idempotency_key == idempotency_key,
+            )
+        )
+        if prior is None or prior.request_fingerprint != fingerprint:
+            raise HTTPException(status_code=409, detail="attribution_event_conflict") from exc
+        return prior
+    await session.refresh(row)
+    ATTRIBUTION_TOUCHES.labels(channel=body.channel).inc()
+    return row
+
+
+@router.get("/leads/{lead_id}/attribution", response_model=list[AttributionTouch])
+async def get_lead_attribution(
+    lead_id: str,
+    request: Request,
+    x_tenant_id: TenantHeader,
+    limit: int = Query(default=50, ge=1, le=100),
+    session: AsyncSession = Depends(get_session),
+) -> list[AttributionTouchModel]:
+    _principal(request).require("marketing.attribution.read")
+    rows = await session.scalars(
+        select(AttributionTouchModel)
+        .where(
+            AttributionTouchModel.tenant_id == x_tenant_id,
+            AttributionTouchModel.lead_id == lead_id,
+        )
+        .order_by(AttributionTouchModel.occurred_at.desc(), AttributionTouchModel.id.desc())
+        .limit(limit)
+    )
+    return list(rows)
+
+
+@router.get("/performance")
+async def performance(
+    request: Request,
+    x_tenant_id: TenantHeader,
+    start: datetime,
+    end: datetime,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, object]:
+    _principal(request).require("marketing.performance.read")
+    if start.tzinfo is None or end.tzinfo is None or end <= start:
+        raise HTTPException(status_code=422, detail="invalid_reporting_window")
+    if end - start > timedelta(days=93):
+        raise HTTPException(status_code=422, detail="reporting_window_too_large")
+    rows = (
+        await session.execute(
+            select(
+                AttributionTouchModel.campaign_id,
+                AttributionTouchModel.channel,
+                func.count(AttributionTouchModel.id),
+            )
+            .where(
+                AttributionTouchModel.tenant_id == x_tenant_id,
+                AttributionTouchModel.occurred_at >= start,
+                AttributionTouchModel.occurred_at < end,
+            )
+            .group_by(AttributionTouchModel.campaign_id, AttributionTouchModel.channel)
+            .order_by(AttributionTouchModel.campaign_id, AttributionTouchModel.channel)
+            .limit(500)
+        )
+    ).all()
+    return {
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        "items": [
+            {
+                "campaign_id": str(campaign_id) if campaign_id else None,
+                "channel": channel,
+                "touch_count": count,
+            }
+            for campaign_id, channel, count in rows
+        ],
+    }
 
 
 @router.get("/providers/meta/accounts/{ad_account_id}/campaigns")

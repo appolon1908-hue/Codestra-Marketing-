@@ -66,3 +66,23 @@ CREATE INDEX IF NOT EXISTS ix_marketing_audit_operation
   ON marketing_audit_events(operation_id);
 CREATE INDEX IF NOT EXISTS ix_marketing_audit_aggregate
   ON marketing_audit_events(tenant_id, aggregate_type, aggregate_id);
+
+CREATE TABLE IF NOT EXISTS marketing_attribution_touches (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id varchar(64) NOT NULL,
+  event_id varchar(128) NOT NULL,
+  lead_id varchar(128) NOT NULL,
+  campaign_id uuid,
+  channel varchar(64) NOT NULL,
+  occurred_at timestamptz NOT NULL,
+  metadata_hash varchar(64) NOT NULL,
+  idempotency_key varchar(200) NOT NULL,
+  request_fingerprint varchar(64) NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT uq_attribution_tenant_event UNIQUE (tenant_id, event_id),
+  CONSTRAINT uq_attribution_tenant_idempotency UNIQUE (tenant_id, idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS ix_attribution_tenant_lead_time
+  ON marketing_attribution_touches(tenant_id, lead_id, occurred_at DESC);
+CREATE INDEX IF NOT EXISTS ix_attribution_tenant_campaign_time
+  ON marketing_attribution_touches(tenant_id, campaign_id, occurred_at DESC);

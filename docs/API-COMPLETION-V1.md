@@ -9,8 +9,8 @@ This branch completes the governed Marketing control plane on the existing Codes
 - durable campaign activation request/status
 - audience create/list/detail/update
 - creative create/list/detail/update and approval lifecycle
-- attribution touch intake and lead attribution readback
-- bounded aggregate performance reporting
+- `POST /v1/marketing/attribution/touches` and `GET /v1/marketing/leads/{lead_id}/attribution`
+- bounded `GET /v1/marketing/performance` reporting (maximum 93-day window and 500 groups)
 - allowlisted Meta read-sync request/status
 
 ## Security and durability

@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import json
 import uuid
+from datetime import datetime, timedelta
 
 import pytest
 from fastapi import HTTPException
@@ -19,6 +20,10 @@ from app.main import (
     CampaignUpdate,
     CreativeCreate,
     CreativeUpdate,
+    AttributionTouchCreate,
+    create_attribution_touch,
+    get_lead_attribution,
+    performance,
     activate_campaign,
     approve_campaign,
     approve_creative,
@@ -38,7 +43,7 @@ from app.main import (
 )
 from app.models import AuditEventModel, CampaignModel, OperationModel, OutboxModel
 from app.middleware_client import MiddlewareDeliveryError
-from app.outbox_worker import run_once
+from app.outbox_worker import claim_one, complete, run_once
 
 pytestmark = pytest.mark.postgres
 
@@ -63,11 +68,27 @@ async def _seed_outbox(sessions, suffix: str) -> uuid.UUID:
     payload = {
         "operation_id": str(operation_id),
         "campaign_id": str(campaign_id),
+        "action": "activate",
+        "expected_state": "approved",
         "expected_version": 1,
         "tenant_id": tenant_id,
         "correlation_id": correlation_id,
     }
     async with sessions() as session:
+        session.add(
+            CampaignModel(
+                id=campaign_id,
+                tenant_id=tenant_id,
+                name="Worker campaign",
+                objective="leads",
+                daily_budget_minor=0,
+                currency="USD",
+                state="approved",
+                idempotency_key=f"campaign-{suffix}-{uuid.uuid4()}",
+                request_fingerprint="0" * 64,
+                resource_version=1,
+            )
+        )
         session.add(
             OperationModel(
                 id=operation_id,
@@ -142,6 +163,59 @@ async def test_outbox_worker_retries_then_dead_letters_unknown_outcome(monkeypat
                 AuditEventModel.outcome == "dead_letter",
             )
         ) == 1
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_outbox_worker_rejects_stale_campaign_before_delivery(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("LIVE_ADVERTISING_ENABLED", "true")
+    engine = create_async_engine(os.environ["DATABASE_URL"])
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    operation_id = await _seed_outbox(sessions, "stale")
+    async with sessions() as session:
+        operation = await session.get(OperationModel, operation_id)
+        campaign = await session.get(CampaignModel, operation.aggregate_id)
+        campaign.resource_version = 2
+        campaign.state = "draft"
+        await session.commit()
+    client = _RecordingMiddleware()
+    assert await run_once(client, lease_seconds=30, max_attempts=3, session_factory=sessions) is True
+    assert client.payloads == []
+    async with sessions() as session:
+        operation = await session.get(OperationModel, operation_id)
+        outbox = await session.scalar(select(OutboxModel).where(OutboxModel.operation_id == operation_id))
+        assert operation.state == "failed"
+        assert operation.attempts == 1
+        assert outbox.state == "dead_letter"
+        assert outbox.last_error_code == "campaign_approval_stale"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_expired_worker_claim_cannot_finalize_a_newer_lease(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("LIVE_ADVERTISING_ENABLED", "true")
+    engine = create_async_engine(os.environ["DATABASE_URL"])
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    operation_id = await _seed_outbox(sessions, "fence")
+    stale_claim = await claim_one(30, session_factory=sessions)
+    assert stale_claim is not None and stale_claim.operation_id == operation_id
+    async with sessions() as session:
+        outbox = await session.scalar(
+            select(OutboxModel).where(OutboxModel.operation_id == operation_id).with_for_update()
+        )
+        outbox.attempts += 1
+        await session.commit()
+    await complete(
+        stale_claim,
+        {"operation_id": "middleware-stale", "state": "accepted"},
+        session_factory=sessions,
+    )
+    async with sessions() as session:
+        operation = await session.get(OperationModel, operation_id)
+        outbox = await session.scalar(select(OutboxModel).where(OutboxModel.operation_id == operation_id))
+        assert operation.state == "pending"
+        assert outbox.state == "processing"
+        assert outbox.attempts == stale_claim.attempts + 1
     await engine.dispose()
 
 
@@ -372,4 +446,36 @@ async def test_disabled_activation_is_durable_idempotent_and_has_no_outbox():
             select(func.count()).select_from(CampaignModel).where(CampaignModel.id == campaign_id)
         ) == 1
 
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_attribution_is_tenant_scoped_idempotent_and_reporting_is_bounded():
+    engine = create_async_engine(os.environ["DATABASE_URL"])
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    tenant_id = f"tenant-attribution-{uuid.uuid4()}"
+    request = _request(tenant_id, "attribution-writer", {"marketing.attribution.write"})
+    request.state.correlation_id = f"corr-{uuid.uuid4()}"
+    body = AttributionTouchCreate(
+        event_id=f"event-{uuid.uuid4()}",
+        lead_id="lead-synthetic-1",
+        channel="paid_search",
+        occurred_at=datetime.now().astimezone(),
+        metadata={"source": "synthetic"},
+    )
+    key = f"attribution-{uuid.uuid4()}"
+    async with sessions() as session:
+        first = await create_attribution_touch(body, request, tenant_id, key, session)
+    async with sessions() as session:
+        duplicate = await create_attribution_touch(body, request, tenant_id, key, session)
+        assert duplicate.id == first.id
+    reader = _request(tenant_id, "attribution-reader", {"marketing.attribution.read", "marketing.performance.read"})
+    async with sessions() as session:
+        rows = await get_lead_attribution("lead-synthetic-1", reader, tenant_id, 50, session)
+        assert [row.id for row in rows] == [first.id]
+        now = datetime.now().astimezone()
+        report = await performance(reader, tenant_id, now - timedelta(days=1), now + timedelta(seconds=1), session)
+        assert report["items"][0]["touch_count"] == 1
+        with pytest.raises(HTTPException, match="reporting_window_too_large"):
+            await performance(reader, tenant_id, now - timedelta(days=94), now, session)
     await engine.dispose()

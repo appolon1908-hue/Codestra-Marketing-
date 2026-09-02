@@ -11,7 +11,7 @@ from sqlalchemy import and_, or_, select
 
 from .db import SessionLocal
 from .middleware_client import MiddlewareDeliveryError, MiddlewareMarketingClient
-from .models import AuditEventModel, OperationModel, OutboxModel
+from .models import AuditEventModel, CampaignModel, OperationModel, OutboxModel
 
 
 UTC = timezone.utc
@@ -52,6 +52,13 @@ async def claim_one(lease_seconds: int, *, session_factory=SessionLocal) -> Clai
         row.attempts += 1
         row.lease_until = now + timedelta(seconds=lease_seconds)
         row.last_error_code = None
+        operation = await session.get(OperationModel, row.operation_id, with_for_update=True)
+        if operation is None:
+            row.state = "dead_letter"
+            row.last_error_code = "operation_missing"
+            await session.commit()
+            return None
+        operation.attempts = row.attempts
         await session.commit()
         return Claim(row.id, row.operation_id, json.loads(row.payload_json), row.attempts)
 
@@ -62,7 +69,12 @@ async def complete(claim: Claim, result: dict[str, object], *, session_factory=S
         operation = await session.scalar(
             select(OperationModel).where(OperationModel.id == claim.operation_id).with_for_update()
         )
-        if row is None or operation is None or row.state != "processing":
+        if (
+            row is None
+            or operation is None
+            or row.state != "processing"
+            or row.attempts != claim.attempts
+        ):
             return
         row.state = "published"
         row.lease_until = None
@@ -87,7 +99,12 @@ async def fail(
         operation = await session.scalar(
             select(OperationModel).where(OperationModel.id == claim.operation_id).with_for_update()
         )
-        if row is None or operation is None or row.state != "processing":
+        if (
+            row is None
+            or operation is None
+            or row.state != "processing"
+            or row.attempts != claim.attempts
+        ):
             return
         terminal = not error.retryable or claim.attempts >= max_attempts
         row.state = "dead_letter" if terminal else "pending"
@@ -127,6 +144,37 @@ async def run_once(
     item = await claim_one(lease_seconds, session_factory=session_factory)
     if item is None:
         return False
+    try:
+        expected_version = int(item.payload["expected_version"])
+        expected_state = str(item.payload["expected_state"])
+        campaign_id = UUID(str(item.payload["campaign_id"]))
+    except (KeyError, TypeError, ValueError):
+        await fail(
+            item,
+            MiddlewareDeliveryError("activation_payload_invalid", retryable=False),
+            max_attempts,
+            session_factory=session_factory,
+        )
+        return True
+    async with session_factory() as session:
+        campaign = await session.scalar(
+            select(CampaignModel).where(
+                CampaignModel.id == campaign_id,
+                CampaignModel.tenant_id == str(item.payload.get("tenant_id", "")),
+            )
+        )
+    if (
+        campaign is None
+        or campaign.state != expected_state
+        or campaign.resource_version != expected_version
+    ):
+        await fail(
+            item,
+            MiddlewareDeliveryError("campaign_approval_stale", retryable=False),
+            max_attempts,
+            session_factory=session_factory,
+        )
+        return True
     try:
         result = await client.deliver(item.payload)
     except MiddlewareDeliveryError as exc:

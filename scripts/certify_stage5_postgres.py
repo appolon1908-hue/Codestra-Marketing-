@@ -26,6 +26,7 @@ TABLES = (
     "marketing_operations",
     "marketing_outbox",
     "marketing_audit_events",
+    "marketing_attribution_touches",
 )
 
 
