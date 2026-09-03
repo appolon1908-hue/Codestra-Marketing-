@@ -26,7 +26,8 @@ def validate(record: dict) -> None:
         raise ValueError("unexpected runtime authority schema")
     if record.get("repository") != "appolon1908-hue/Codestra-Marketing-":
         raise ValueError("unexpected repository authority")
-    if record.get("protected_source_sha") != "460ff98f64ef9f0724fe4d2afc51a1a6c5b053dd":
+    protected_source_sha = record.get("protected_source_sha")
+    if protected_source_sha != "460ff98f64ef9f0724fe4d2afc51a1a6c5b053dd":
         raise ValueError("protected_source_sha differs from the reviewed source base")
     if record.get("public_hostname") != "marketing.codestra.co":
         raise ValueError("unexpected public hostname")
@@ -43,9 +44,12 @@ def validate(record: dict) -> None:
         raise ValueError("source capability baseline must remain fail closed")
 
     gates = record.get("required_gates", {})
-    if set(gates) != EXPECTED_GATES or any(type(value) is not bool for value in gates.values()):
+    if set(gates) != EXPECTED_GATES or any(
+        type(value) is not bool for value in gates.values()
+    ):
         raise ValueError("required production gates must be an exact boolean map")
     runtime = record.get("runtime_evidence", {})
+    runtime_git_sha = runtime.get("git_sha", "")
     derived_gates = {
         "tls_valid": runtime.get("tls_valid") is True,
         "health_reachable": runtime.get("health_reachable") is True,
@@ -53,14 +57,20 @@ def validate(record: dict) -> None:
             re.fullmatch(r"sha256:[0-9a-f]{64}", runtime.get("image_digest", ""))
         ),
         "protected_git_sha_exposed": bool(
-            re.fullmatch(r"[0-9a-f]{40}", runtime.get("git_sha", ""))
+            re.fullmatch(r"[0-9a-f]{40}", runtime_git_sha)
+            and runtime_git_sha == protected_source_sha
         ),
-        "live_advertising_readback_false": runtime.get("live_advertising_enabled") is False,
+        "live_advertising_readback_false": runtime.get("live_advertising_enabled")
+        is False,
     }
     for gate, derived in derived_gates.items():
         if gates[gate] is not derived:
             raise ValueError(f"{gate} differs from runtime evidence")
-    for gate in ("runtime_owner_attested", "gateway_path_verified", "rollback_target_verified"):
+    for gate in (
+        "runtime_owner_attested",
+        "gateway_path_verified",
+        "rollback_target_verified",
+    ):
         if gates[gate] is not False:
             raise ValueError(f"{gate} lacks an evidence reference")
     all_gates_pass = all(gates.values())
@@ -77,8 +87,9 @@ def validate(record: dict) -> None:
 
 
 def main() -> int:
-    validate(json.loads(AUTHORITY.read_text()))
-    print("MARKETING_RUNTIME_LOCATION=49.12.145.107")
+    record = json.loads(AUTHORITY.read_text())
+    validate(record)
+    print(f"MARKETING_RUNTIME_LOCATION={record['runtime_location']}")
     print("MARKETING_PRODUCTION_AUTHORITY=FAIL")
     print("PRODUCTION_WRITES_AUTHORIZED=NO")
     return 0
