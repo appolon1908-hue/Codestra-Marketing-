@@ -31,6 +31,10 @@ def test_current_unverified_off_host_record_is_valid(authority):
     MODULE.validate(authority)
 
 
+def test_observation_timestamp_is_recorded_in_utc(authority):
+    assert authority["recorded_at"] == "2026-09-01T18:05:43Z"
+
+
 def test_cannot_claim_production_ready(authority):
     rejected(authority, lambda row: row.__setitem__("production_ready", True))
 
@@ -60,3 +64,35 @@ def test_source_capabilities_remain_fail_closed(authority):
             "live_advertising_default", True
         ),
     )
+
+
+def test_runtime_git_sha_must_equal_protected_source(authority):
+    def mutate(row):
+        row["runtime_evidence"]["git_sha"] = "a" * 40
+        row["required_gates"]["protected_git_sha_exposed"] = True
+
+    rejected(authority, mutate)
+
+
+def test_matching_protected_runtime_sha_can_satisfy_only_its_gate(authority):
+    candidate = copy.deepcopy(authority)
+    candidate["runtime_evidence"]["git_sha"] = candidate["protected_source_sha"]
+    candidate["required_gates"]["protected_git_sha_exposed"] = True
+    MODULE.validate(candidate)
+
+
+def test_main_reports_the_validated_runtime_location(
+    authority, tmp_path, monkeypatch, capsys
+):
+    candidate = copy.deepcopy(authority)
+    candidate["observed_ipv4"] = "203.0.113.10"
+    candidate["runtime_location"] = "203.0.113.10"
+    authority_path = tmp_path / "production-runtime-authority.json"
+    authority_path.write_text(json.dumps(candidate))
+    monkeypatch.setattr(MODULE, "AUTHORITY", authority_path)
+
+    assert MODULE.main() == 0
+    output = capsys.readouterr().out
+    assert "MARKETING_RUNTIME_LOCATION=203.0.113.10" in output
+    assert "MARKETING_PRODUCTION_AUTHORITY=FAIL" in output
+    assert "PRODUCTION_WRITES_AUTHORIZED=NO" in output
